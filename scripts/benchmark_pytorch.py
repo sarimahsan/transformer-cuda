@@ -50,7 +50,7 @@ def benchmark_framework(
         d_ff=4 * d_model
     ).to(device)
 
-    optimizer = model.configure_optimizers(lr=3e-4)
+    optimizer = model.configure_optimizers(lr=3e-4, capturable=(mode == "graphs"))
 
     # Compile mode if requested
     if mode == "compile":
@@ -78,21 +78,20 @@ def benchmark_framework(
         static_x = torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
         static_y = torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
 
-        # Warmup for graph capture
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
                 optimizer.zero_grad(set_to_none=True)
-                logits, loss = model(static_x, static_y)
-                loss.backward()
+                _out, _loss = model(static_x, static_y)
+                _loss.backward()
                 optimizer.step()
+            del _out, _loss
         torch.cuda.current_stream().wait_stream(s)
 
-        # Capture graph
         graph = torch.cuda.CUDAGraph()
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, stream=s):
             static_logits, static_loss = model(static_x, static_y)
             static_loss.backward()
             optimizer.step()

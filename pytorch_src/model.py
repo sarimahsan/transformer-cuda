@@ -132,5 +132,5 @@ class PyTorchGPT(nn.Module):
 
         return logits, loss
 
-    def configure_optimizers(self, lr: float = 3e-4, weight_decay: float = 0.01, betas: tuple = (0.9, 0.999), eps: float = 1e-8):
-        return torch.optim.AdamW(self.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+    def configure_optimizers(self, lr: float = 3e-4, weight_decay: float = 0.01, betas: tuple = (0.9, 0.999), eps: float = 1e-8, capturable: bool = False):
+        return torch.optim.AdamW(self.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, capturable=capturable)
