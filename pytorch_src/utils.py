@@ -42,6 +42,93 @@ def export_weights_to_cuda(model: PyTorchGPT, output_path: str):
     return len(flattened)
 
 
+def import_weights_from_cuda(model: PyTorchGPT, weights_path: str):
+    """
+    Imports parameters from a contiguous raw float32 binary file into a PyTorchGPT model.
+    """
+    raw_data = np.fromfile(weights_path, dtype=np.float32)
+    offset = 0
+
+    V = model.vocab_size
+    C = model.d_model
+    T = model.max_seq_len
+    d_ff = model.d_ff
+
+    with torch.no_grad():
+        # 1. Embeddings
+        size = V * C
+        model.tok_emb.weight.copy_(torch.from_numpy(raw_data[offset : offset + size].reshape(V, C)))
+        offset += size
+
+        size = T * C
+        model.pos_emb.weight.copy_(torch.from_numpy(raw_data[offset : offset + size].reshape(T, C)))
+        offset += size
+
+        # 2. Layers
+        for block in model.blocks:
+            size = C
+            block.ln_1.weight.copy_(torch.from_numpy(raw_data[offset : offset + size]))
+            offset += size
+            block.ln_1.bias.copy_(torch.from_numpy(raw_data[offset : offset + size]))
+            offset += size
+
+            size = C * (3 * C)
+            w_qkv = torch.from_numpy(raw_data[offset : offset + size].reshape(C, 3 * C)).t()
+            block.attn.qkv_proj.weight.copy_(w_qkv)
+            offset += size
+
+            size = 3 * C
+            block.attn.qkv_proj.bias.copy_(torch.from_numpy(raw_data[offset : offset + size]))
+            offset += size
+
+            size = C * C
+            w_proj = torch.from_numpy(raw_data[offset : offset + size].reshape(C, C)).t()
+            block.attn.out_proj.weight.copy_(w_proj)
+            offset += size
+
+            size = C
+            block.attn.out_proj.bias.copy_(torch.from_numpy(raw_data[offset : offset + size]))
+            offset += size
+
+            size = C
+            block.ln_2.weight.copy_(torch.from_numpy(raw_data[offset : offset + size]))
+            offset += size
+            block.ln_2.bias.copy_(torch.from_numpy(raw_data[offset : offset + size]))
+            offset += size
+
+            size = C * d_ff
+            w_ffn1 = torch.from_numpy(raw_data[offset : offset + size].reshape(C, d_ff)).t()
+            block.ffn_1.weight.copy_(w_ffn1)
+            offset += size
+
+            size = d_ff
+            block.ffn_1.bias.copy_(torch.from_numpy(raw_data[offset : offset + size]))
+            offset += size
+
+            size = d_ff * C
+            w_ffn2 = torch.from_numpy(raw_data[offset : offset + size].reshape(d_ff, C)).t()
+            block.ffn_2.weight.copy_(w_ffn2)
+            offset += size
+
+            size = C
+            block.ffn_2.bias.copy_(torch.from_numpy(raw_data[offset : offset + size]))
+            offset += size
+
+        # 3. Final LN & Head
+        size = C
+        model.ln_f.weight.copy_(torch.from_numpy(raw_data[offset : offset + size]))
+        offset += size
+        model.ln_f.bias.copy_(torch.from_numpy(raw_data[offset : offset + size]))
+        offset += size
+
+        size = C * V
+        w_head = torch.from_numpy(raw_data[offset : offset + size].reshape(C, V)).t()
+        model.head.weight.copy_(w_head)
+        offset += size
+
+    return offset
+
+
 def extract_pytorch_gradients(model: PyTorchGPT) -> np.ndarray:
     """
     Extracts all parameter gradients from PyTorch model in the contiguous

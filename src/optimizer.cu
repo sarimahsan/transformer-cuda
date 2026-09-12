@@ -1,6 +1,7 @@
 #include "optimizer.h"
 #include "common.h"
 #include <cmath>
+#include <vector>
 
 #define WARP_SIZE 32
 

@@ -22,7 +22,9 @@ TransformerModel::TransformerModel(const TransformerConfig& cfg) : config(cfg) {
 
 TransformerModel::~TransformerModel() {
     free_memory();
-    CUBLAS_CHECK(cublasDestroy(cublas_handle));
+    if (cublas_handle != nullptr) {
+        cublasDestroy(cublas_handle);
+    }
 }
 
 void TransformerModel::allocate_memory() {
