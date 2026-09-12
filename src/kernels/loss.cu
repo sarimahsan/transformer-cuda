@@ -1,6 +1,7 @@
 #include "kernels/loss.cuh"
 #include "common.h"
 #include <cfloat>
+#include <vector>
 
 #define WARP_SIZE 32
 
