@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+bin/
+*.o
+*.obj
+*.exe
+*.out
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Data and checkpoints
+data/*.bin
+data/*.txt
+!data/README.md
+tests/parity_data/
+*.pt
+*.bin
+checkpoint.bin
+
+# Results
+results/*.json
+results/figures/*.png
+results/figures/*.pdf
