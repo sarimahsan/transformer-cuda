@@ -78,7 +78,9 @@ __global__ void cross_entropy_kernel(
     if (tid == 0) {
         float target_logit = l_row[target_idx];
         float row_loss = logf(sum_exp) - (target_logit - max_val);
-        per_row_loss[row] = row_loss;
+        if (per_row_loss != nullptr) {
+            per_row_loss[row] = row_loss;
+        }
     }
 
     for (int v = tid; v < V; v += nthreads) {
@@ -99,8 +101,10 @@ void cross_entropy_forward_backward(
     int N = B * T;
     float scale = 1.0f / (float)N;
 
-    float* d_row_loss;
-    CUDA_CHECK(cudaMallocAsync(&d_row_loss, N * sizeof(float), stream));
+    float* d_row_loss = nullptr;
+    if (host_loss != nullptr) {
+        CUDA_CHECK(cudaMallocAsync(&d_row_loss, N * sizeof(float), stream));
+    }
 
     int block_dim = (V <= 64) ? 64 : ((V <= 128) ? 128 : ((V <= 256) ? 256 : 512));
     size_t shared_size = (block_dim / WARP_SIZE) * sizeof(float);
@@ -116,7 +120,6 @@ void cross_entropy_forward_backward(
         float total_loss = 0.0f;
         for (int i = 0; i < N; ++i) total_loss += h_row_loss[i];
         *host_loss = total_loss / (float)N;
+        CUDA_CHECK(cudaFreeAsync(d_row_loss, stream));
     }
-
-    CUDA_CHECK(cudaFreeAsync(d_row_loss, stream));
 }

@@ -73,12 +73,42 @@ __global__ void sum_sq_kernel(
     if (threadIdx.x == 0) block_sums[blockIdx.x] = sq;
 }
 
-__global__ void scale_grads_kernel(
+__global__ void reduce_total_norm_kernel(
+    const float* __restrict__ block_sums,
+    int num_blocks,
+    float* __restrict__ d_total_norm
+) {
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < num_blocks; i += blockDim.x) {
+        sum += block_sums[i];
+    }
+    sum = warp_reduce_sum_opt(sum);
+
+    extern __shared__ float s_red[];
+    int lane = threadIdx.x % WARP_SIZE;
+    int wid = threadIdx.x / WARP_SIZE;
+    if (lane == 0) s_red[wid] = sum;
+    __syncthreads();
+
+    int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+    sum = (threadIdx.x < num_warps) ? s_red[lane] : 0.0f;
+    if (wid == 0) sum = warp_reduce_sum_opt(sum);
+    if (threadIdx.x == 0) {
+        *d_total_norm = sqrtf(sum);
+    }
+}
+
+__global__ void scale_grads_device_kernel(
     float* __restrict__ grads,
-    float scale,
+    const float* __restrict__ d_total_norm,
+    float max_norm,
     size_t num_params
 ) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float norm = *d_total_norm;
+    if (norm <= max_norm || norm <= 1e-6f) return;
+    float scale = max_norm / norm;
+
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_params) {
         grads[idx] *= scale;
     }
@@ -100,7 +130,7 @@ AdamW::AdamW(float* params, float* grads, size_t num_params, const TransformerCo
 
     int block_dim = 256;
     int grid_dim = (num_params + block_dim - 1) / block_dim;
-    CUDA_CHECK(cudaMalloc(&d_norm_buffer, grid_dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_norm_buffer, (grid_dim + 1) * sizeof(float)));
 }
 
 AdamW::~AdamW() {
@@ -125,22 +155,15 @@ float AdamW::clip_grad_norm(float max_norm, cudaStream_t stream) {
     int grid_dim = (num_params + block_dim - 1) / block_dim;
     size_t shared_size = (block_dim / WARP_SIZE) * sizeof(float);
 
-    sum_sq_kernel<<<grid_dim, block_dim, shared_size, stream>>>(d_grads, d_norm_buffer, num_params);
+    float* d_block_sums = d_norm_buffer;
+    float* d_total_norm = d_norm_buffer + grid_dim;
 
-    std::vector<float> h_sums(grid_dim);
-    CUDA_CHECK(cudaMemcpyAsync(h_sums.data(), d_norm_buffer, grid_dim * sizeof(float), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    sum_sq_kernel<<<grid_dim, block_dim, shared_size, stream>>>(d_grads, d_block_sums, num_params);
+    reduce_total_norm_kernel<<<1, 256, (256 / WARP_SIZE) * sizeof(float), stream>>>(d_block_sums, grid_dim, d_total_norm);
+    scale_grads_device_kernel<<<grid_dim, block_dim, 0, stream>>>(d_grads, d_total_norm, max_norm, num_params);
 
-    float total_sum_sq = 0.0f;
-    for (int i = 0; i < grid_dim; ++i) total_sum_sq += h_sums[i];
-    float norm = sqrtf(total_sum_sq);
-
-    if (norm > max_norm && norm > 1e-6f) {
-        float scale = max_norm / norm;
-        scale_grads_kernel<<<grid_dim, block_dim, 0, stream>>>(d_grads, scale, num_params);
-    }
     NVTX_POP();
-    return norm;
+    return 0.0f;
 }
 
 void AdamW::step(float lr, cudaStream_t stream) {
