@@ -122,8 +122,15 @@ def profile_model(
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=15))
 
     # Category Breakdown Analysis
+    def get_cuda_time(event):
+        for attr in ["cuda_time_total", "device_time_total", "self_cuda_time_total", "self_device_time_total", "cuda_time"]:
+            val = getattr(event, attr, None)
+            if val is not None:
+                return float(val)
+        return 0.0
+
     events = prof.key_averages()
-    total_cuda_us = sum(e.cuda_time_total for e in events)
+    total_cuda_us = sum(get_cuda_time(e) for e in events)
 
     categories = {
         "GEMM / Matrix Multiplication (cuBLAS / Ampere / Turing)": ["gemm", "sgemm", "cutlass", "cublas", "mm", "matmul", "linear", "bmm"],
@@ -137,17 +144,18 @@ def profile_model(
     uncat_time = 0.0
 
     for e in events:
-        if e.cuda_time_total <= 0:
+        t_us = get_cuda_time(e)
+        if t_us <= 0:
             continue
         matched = False
         name_lower = e.key.lower()
         for cat, keywords in categories.items():
             if any(kw in name_lower for kw in keywords):
-                cat_times[cat] += e.cuda_time_total
+                cat_times[cat] += t_us
                 matched = True
                 break
         if not matched:
-            uncat_time += e.cuda_time_total
+            uncat_time += t_us
 
     print("\n" + "=" * 80)
     print(f" HIGH-LEVEL GPU TIME BREAKDOWN ({mode.upper()})")
