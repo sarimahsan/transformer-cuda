@@ -21,6 +21,36 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 
 // QKV Split & Transpose Forward: (B, T, 3 * H * d_head) -> 3 x (B, H, T, d_head)
+__global__ void qkv_split_transpose_fwd_vec4_kernel(
+    const float4* __restrict__ qkv,
+    float4* __restrict__ q,
+    float4* __restrict__ k,
+    float4* __restrict__ v,
+    int B, int T, int H, int d_head_vec4
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = B * T * H * d_head_vec4;
+    if (idx >= total) return;
+
+    int d = idx % d_head_vec4;
+    int h = (idx / d_head_vec4) % H;
+    int t = (idx / (d_head_vec4 * H)) % T;
+    int b = idx / (d_head_vec4 * H * T);
+
+    int in_qkv_stride = 3 * H * d_head_vec4;
+    int in_base = b * T * in_qkv_stride + t * in_qkv_stride;
+
+    int q_offset = in_base + (0 * H + h) * d_head_vec4 + d;
+    int k_offset = in_base + (1 * H + h) * d_head_vec4 + d;
+    int v_offset = in_base + (2 * H + h) * d_head_vec4 + d;
+
+    int out_idx = b * (H * T * d_head_vec4) + h * (T * d_head_vec4) + t * d_head_vec4 + d;
+
+    q[out_idx] = qkv[q_offset];
+    k[out_idx] = qkv[k_offset];
+    v[out_idx] = qkv[v_offset];
+}
+
 __global__ void qkv_split_transpose_fwd_kernel(
     const float* __restrict__ qkv,
     float* __restrict__ q,
@@ -52,6 +82,36 @@ __global__ void qkv_split_transpose_fwd_kernel(
 }
 
 // QKV Split & Transpose Backward
+__global__ void qkv_split_transpose_bwd_vec4_kernel(
+    const float4* __restrict__ dq,
+    const float4* __restrict__ dk,
+    const float4* __restrict__ dv,
+    float4* __restrict__ dqkv,
+    int B, int T, int H, int d_head_vec4
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = B * T * H * d_head_vec4;
+    if (idx >= total) return;
+
+    int d = idx % d_head_vec4;
+    int h = (idx / d_head_vec4) % H;
+    int t = (idx / (d_head_vec4 * H)) % T;
+    int b = idx / (d_head_vec4 * H * T);
+
+    int in_qkv_stride = 3 * H * d_head_vec4;
+    int in_base = b * T * in_qkv_stride + t * in_qkv_stride;
+
+    int q_offset = in_base + (0 * H + h) * d_head_vec4 + d;
+    int k_offset = in_base + (1 * H + h) * d_head_vec4 + d;
+    int v_offset = in_base + (2 * H + h) * d_head_vec4 + d;
+
+    int out_idx = b * (H * T * d_head_vec4) + h * (T * d_head_vec4) + t * d_head_vec4 + d;
+
+    dqkv[q_offset] = dq[out_idx];
+    dqkv[k_offset] = dk[out_idx];
+    dqkv[v_offset] = dv[out_idx];
+}
+
 __global__ void qkv_split_transpose_bwd_kernel(
     const float* __restrict__ dq,
     const float* __restrict__ dk,
@@ -245,6 +305,24 @@ __global__ void causal_softmax_bwd_kernel(
 }
 
 // Merge Heads Transpose Forward: (B, H, T, d_head) -> (B, T, H * d_head)
+__global__ void head_merge_transpose_fwd_vec4_kernel(
+    const float4* __restrict__ in,
+    float4* __restrict__ out,
+    int B, int H, int T, int d_head_vec4
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = B * H * T * d_head_vec4;
+    if (idx >= total) return;
+
+    int d = idx % d_head_vec4;
+    int t = (idx / d_head_vec4) % T;
+    int h = (idx / (d_head_vec4 * T)) % H;
+    int b = idx / (d_head_vec4 * T * H);
+
+    int out_idx = b * (T * H * d_head_vec4) + t * (H * d_head_vec4) + h * d_head_vec4 + d;
+    out[out_idx] = in[idx];
+}
+
 __global__ void head_merge_transpose_fwd_kernel(
     const float* __restrict__ in,
     float* __restrict__ out,
@@ -264,6 +342,24 @@ __global__ void head_merge_transpose_fwd_kernel(
 }
 
 // Merge Heads Transpose Backward: (B, T, H * d_head) -> (B, H, T, d_head)
+__global__ void head_merge_transpose_bwd_vec4_kernel(
+    const float4* __restrict__ dout,
+    float4* __restrict__ din,
+    int B, int H, int T, int d_head_vec4
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = B * H * T * d_head_vec4;
+    if (idx >= total) return;
+
+    int d = idx % d_head_vec4;
+    int t = (idx / d_head_vec4) % T;
+    int h = (idx / (d_head_vec4 * T)) % H;
+    int b = idx / (d_head_vec4 * T * H);
+
+    int out_idx = b * (T * H * d_head_vec4) + t * (H * d_head_vec4) + h * d_head_vec4 + d;
+    din[idx] = dout[out_idx];
+}
+
 __global__ void head_merge_transpose_bwd_kernel(
     const float* __restrict__ dout,
     float* __restrict__ din,
@@ -289,11 +385,24 @@ void qkv_split_transpose_forward(
     cudaStream_t stream
 ) {
     int total = B * T * H * d_head;
-    int block_dim = 256;
-    int grid_dim = (total + block_dim - 1) / block_dim;
-    qkv_split_transpose_fwd_kernel<<<grid_dim, block_dim, 0, stream>>>(
-        qkv, q, k, v, B, T, H, d_head
-    );
+    if (d_head % 4 == 0) {
+        int num_vec4 = total / 4;
+        int block_dim = 256;
+        int grid_dim = (num_vec4 + block_dim - 1) / block_dim;
+        qkv_split_transpose_fwd_vec4_kernel<<<grid_dim, block_dim, 0, stream>>>(
+            reinterpret_cast<const float4*>(qkv),
+            reinterpret_cast<float4*>(q),
+            reinterpret_cast<float4*>(k),
+            reinterpret_cast<float4*>(v),
+            B, T, H, d_head / 4
+        );
+    } else {
+        int block_dim = 256;
+        int grid_dim = (total + block_dim - 1) / block_dim;
+        qkv_split_transpose_fwd_kernel<<<grid_dim, block_dim, 0, stream>>>(
+            qkv, q, k, v, B, T, H, d_head
+        );
+    }
 }
 
 void qkv_split_transpose_backward(
@@ -303,11 +412,24 @@ void qkv_split_transpose_backward(
     cudaStream_t stream
 ) {
     int total = B * T * H * d_head;
-    int block_dim = 256;
-    int grid_dim = (total + block_dim - 1) / block_dim;
-    qkv_split_transpose_bwd_kernel<<<grid_dim, block_dim, 0, stream>>>(
-        dq, dk, dv, dqkv, B, T, H, d_head
-    );
+    if (d_head % 4 == 0) {
+        int num_vec4 = total / 4;
+        int block_dim = 256;
+        int grid_dim = (num_vec4 + block_dim - 1) / block_dim;
+        qkv_split_transpose_bwd_vec4_kernel<<<grid_dim, block_dim, 0, stream>>>(
+            reinterpret_cast<const float4*>(dq),
+            reinterpret_cast<const float4*>(dk),
+            reinterpret_cast<const float4*>(dv),
+            reinterpret_cast<float4*>(dqkv),
+            B, T, H, d_head / 4
+        );
+    } else {
+        int block_dim = 256;
+        int grid_dim = (total + block_dim - 1) / block_dim;
+        qkv_split_transpose_bwd_kernel<<<grid_dim, block_dim, 0, stream>>>(
+            dq, dk, dv, dqkv, B, T, H, d_head
+        );
+    }
 }
 
 void causal_softmax_forward(
@@ -348,11 +470,22 @@ void head_merge_transpose_forward(
     cudaStream_t stream
 ) {
     int total = B * H * T * d_head;
-    int block_dim = 256;
-    int grid_dim = (total + block_dim - 1) / block_dim;
-    head_merge_transpose_fwd_kernel<<<grid_dim, block_dim, 0, stream>>>(
-        in, out, B, H, T, d_head
-    );
+    if (d_head % 4 == 0) {
+        int num_vec4 = total / 4;
+        int block_dim = 256;
+        int grid_dim = (num_vec4 + block_dim - 1) / block_dim;
+        head_merge_transpose_fwd_vec4_kernel<<<grid_dim, block_dim, 0, stream>>>(
+            reinterpret_cast<const float4*>(in),
+            reinterpret_cast<float4*>(out),
+            B, H, T, d_head / 4
+        );
+    } else {
+        int block_dim = 256;
+        int grid_dim = (total + block_dim - 1) / block_dim;
+        head_merge_transpose_fwd_kernel<<<grid_dim, block_dim, 0, stream>>>(
+            in, out, B, H, T, d_head
+        );
+    }
 }
 
 void head_merge_transpose_backward(
@@ -362,11 +495,22 @@ void head_merge_transpose_backward(
     cudaStream_t stream
 ) {
     int total = B * H * T * d_head;
-    int block_dim = 256;
-    int grid_dim = (total + block_dim - 1) / block_dim;
-    head_merge_transpose_bwd_kernel<<<grid_dim, block_dim, 0, stream>>>(
-        dout, din, B, H, T, d_head
-    );
+    if (d_head % 4 == 0) {
+        int num_vec4 = total / 4;
+        int block_dim = 256;
+        int grid_dim = (num_vec4 + block_dim - 1) / block_dim;
+        head_merge_transpose_bwd_vec4_kernel<<<grid_dim, block_dim, 0, stream>>>(
+            reinterpret_cast<const float4*>(dout),
+            reinterpret_cast<float4*>(din),
+            B, H, T, d_head / 4
+        );
+    } else {
+        int block_dim = 256;
+        int grid_dim = (total + block_dim - 1) / block_dim;
+        head_merge_transpose_bwd_kernel<<<grid_dim, block_dim, 0, stream>>>(
+            dout, din, B, H, T, d_head
+        );
+    }
 }
 
 // FlashAttention-Style Tiled Causal Attention Forward Kernel

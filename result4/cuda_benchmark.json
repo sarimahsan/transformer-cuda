@@ -1,0 +1,13 @@
+{
+  "framework": "Pure CUDA",
+  "batch_size": 32,
+  "seq_len": 256,
+  "d_model": 256,
+  "num_layers": 6,
+  "num_heads": 8,
+  "tokens_per_sec": 81273.71,
+  "forward": {"mean_ms": 36.42, "std_ms": 0.45, "median_ms": 36.42},
+  "backward": {"mean_ms": 63.10, "std_ms": 0.40, "median_ms": 63.06},
+  "optimizer": {"mean_ms": 1.26, "std_ms": 0.07, "median_ms": 1.27},
+  "step": {"mean_ms": 100.80, "std_ms": 0.76, "median_ms": 100.84}
+}

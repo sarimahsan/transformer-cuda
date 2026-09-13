@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--tiled_attn", action="store_true", help="Enable FlashAttention-style tiled online softmax")
+    parser.add_argument("--cuda_graph", action="store_true", help="Enable CUDA Graph capture and replay")
     parser.add_argument("--profile", action="store_true", help="Run automated Nsight Systems profiling suite")
     parser.add_argument("--all", action="store_true", help="Run parity audit, benchmarks, and plot generation")
     args = parser.parse_args()
@@ -58,6 +59,8 @@ def main():
             ]
             if args.tiled_attn:
                 cuda_cmd.append("--tiled_attn")
+            if args.cuda_graph:
+                cuda_cmd.append("--cuda_graph")
 
             res = subprocess.run(cuda_cmd, capture_output=True, text=True)
             if res.returncode == 0:
