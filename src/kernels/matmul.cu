@@ -89,7 +89,7 @@ void matmul_cublaslt(
     if (workspace != nullptr && workspace_size > 0) {
         cublasLtMatmulPreferenceSetAttribute(
             preference,
-            CUBLASLT_MATMUL_PREFERENCE_WORKSPACE_SIZE,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
             &workspace_size,
             sizeof(workspace_size)
         );
@@ -121,6 +121,21 @@ void matmul_cublaslt(
             C, layoutC,
             C, layoutC,
             &heuristicResult.algo,
+            workspace,
+            workspace_size,
+            stream
+        );
+    } else {
+        cublasLtMatmul(
+            lt_handle,
+            operationDesc,
+            &alpha,
+            B, layoutB,
+            A, layoutA,
+            &beta,
+            C, layoutC,
+            C, layoutC,
+            NULL,
             workspace,
             workspace_size,
             stream
