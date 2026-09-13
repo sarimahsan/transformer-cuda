@@ -30,5 +30,7 @@ void layernorm_backward(
     float* dgamma,
     float* dbeta,
     int N, int C,
+    const float* residual_add = nullptr,
+    bool accumulate = false,
     cudaStream_t stream = 0
 );

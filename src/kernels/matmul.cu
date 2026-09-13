@@ -13,7 +13,11 @@ void matmul_forward(
     float beta,
     cudaStream_t stream
 ) {
-    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    cudaStream_t cur_stream = nullptr;
+    cublasGetStream(handle, &cur_stream);
+    if (cur_stream != stream) {
+        CUBLAS_CHECK(cublasSetStream(handle, stream));
+    }
 
     cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
@@ -165,7 +169,11 @@ void matmul_batched_strided(
     float beta,
     cudaStream_t stream
 ) {
-    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    cudaStream_t cur_stream = nullptr;
+    cublasGetStream(handle, &cur_stream);
+    if (cur_stream != stream) {
+        CUBLAS_CHECK(cublasSetStream(handle, stream));
+    }
 
     cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;

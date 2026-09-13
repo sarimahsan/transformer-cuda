@@ -247,6 +247,7 @@ void TransformerModel::init_parameters(unsigned long long seed) {
 
 void TransformerModel::forward(const int* d_tokens, cudaStream_t stream) {
     NVTX_PUSH("Transformer_Forward");
+    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
     int B = static_cast<int>(config.batch_size);
     int T = static_cast<int>(config.max_seq_len);
     int C = static_cast<int>(config.d_model);
@@ -381,6 +382,7 @@ void TransformerModel::forward(const int* d_tokens, cudaStream_t stream) {
 
 void TransformerModel::backward(const int* d_tokens, const int* d_targets, float* host_loss, cudaStream_t stream) {
     NVTX_PUSH("Transformer_Backward");
+    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
     int B = static_cast<int>(config.batch_size);
     int T = static_cast<int>(config.max_seq_len);
     int C = static_cast<int>(config.d_model);
@@ -395,7 +397,18 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
     cross_entropy_forward_backward(acts.logits, d_targets, grads.d_logits, host_loss, B, T, V, stream);
 
     // 2. Head Projection Backward:
-    matmul_forward(cublas_handle, acts.ln_f_out, grads.d_logits, grads.params.head_w, C, V, B * T, true, false, 1.0f, 0.0f, stream);
+    if (cublaslt_handle != nullptr) {
+        matmul_cublaslt(
+            cublaslt_handle,
+            acts.ln_f_out, grads.d_logits, grads.params.head_w,
+            C, V, B * T,
+            CUBLASLT_EPILOGUE_DEFAULT, nullptr,
+            d_cublaslt_workspace, cublaslt_workspace_size,
+            true, false, 1.0f, 0.0f, stream
+        );
+    } else {
+        matmul_forward(cublas_handle, acts.ln_f_out, grads.d_logits, grads.params.head_w, C, V, B * T, true, false, 1.0f, 0.0f, stream);
+    }
     matmul_forward(cublas_handle, grads.d_logits, params.head_w, grads.d_ln_f_out, B * T, C, V, false, true, 1.0f, 0.0f, stream);
 
     // 3. Final LayerNorm Backward
@@ -404,7 +417,7 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
         grads.d_ln_f_out, prev_block_out, params.ln_f_gamma,
         acts.ln_f_mean, acts.ln_f_rstd,
         grads.d_block_out, grads.params.ln_f_gamma, grads.params.ln_f_beta,
-        B * T, C, stream
+        B * T, C, nullptr, false, stream
     );
     NVTX_POP();
 
@@ -423,7 +436,18 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
 
         // FFN2 Backward (zero-copy branch directly reading grads.d_block_out)
         NVTX_PUSH("FFN2_Bwd");
-        matmul_forward(cublas_handle, la.ffn_gelu, grads.d_block_out, d_lp.ffn2_w, d_ff, C, B * T, true, false, 1.0f, 0.0f, stream);
+        if (cublaslt_handle != nullptr) {
+            matmul_cublaslt(
+                cublaslt_handle,
+                la.ffn_gelu, grads.d_block_out, d_lp.ffn2_w,
+                d_ff, C, B * T,
+                CUBLASLT_EPILOGUE_DEFAULT, nullptr,
+                d_cublaslt_workspace, cublaslt_workspace_size,
+                true, false, 1.0f, 0.0f, stream
+            );
+        } else {
+            matmul_forward(cublas_handle, la.ffn_gelu, grads.d_block_out, d_lp.ffn2_w, d_ff, C, B * T, true, false, 1.0f, 0.0f, stream);
+        }
         bias_backward(grads.d_block_out, d_lp.ffn2_b, B * T, C, stream);
         matmul_forward(cublas_handle, grads.d_block_out, lp.ffn2_w, grads.d_ffn_gelu, B * T, d_ff, C, false, true, 1.0f, 0.0f, stream);
         NVTX_POP();
@@ -435,26 +459,47 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
 
         // FFN1 Backward
         NVTX_PUSH("FFN1_Bwd");
-        matmul_forward(cublas_handle, la.ln2_out, grads.d_ffn1_out, d_lp.ffn1_w, C, d_ff, B * T, true, false, 1.0f, 0.0f, stream);
+        if (cublaslt_handle != nullptr) {
+            matmul_cublaslt(
+                cublaslt_handle,
+                la.ln2_out, grads.d_ffn1_out, d_lp.ffn1_w,
+                C, d_ff, B * T,
+                CUBLASLT_EPILOGUE_DEFAULT, nullptr,
+                d_cublaslt_workspace, cublaslt_workspace_size,
+                true, false, 1.0f, 0.0f, stream
+            );
+        } else {
+            matmul_forward(cublas_handle, la.ln2_out, grads.d_ffn1_out, d_lp.ffn1_w, C, d_ff, B * T, true, false, 1.0f, 0.0f, stream);
+        }
         bias_backward(grads.d_ffn1_out, d_lp.ffn1_b, B * T, d_ff, stream);
         matmul_forward(cublas_handle, grads.d_ffn1_out, lp.ffn1_w, grads.d_ln2_out, B * T, C, d_ff, false, true, 1.0f, 0.0f, stream);
         NVTX_POP();
 
-        // LayerNorm 2 Backward
+        // LayerNorm 2 Backward: accumulated directly into grads.d_res1_out
         NVTX_PUSH("LN2_Bwd");
         layernorm_backward(
             grads.d_ln2_out, la.res1_out, lp.ln2_gamma,
             la.ln2_mean, la.ln2_rstd,
-            grads.d_emb_out, d_lp.ln2_gamma, d_lp.ln2_beta,
-            B * T, C, stream
+            grads.d_res1_out, d_lp.ln2_gamma, d_lp.ln2_beta,
+            B * T, C, nullptr, true, stream
         );
-        residual_accumulate(grads.d_res1_out, grads.d_emb_out, B * T * C, stream);
         NVTX_POP();
 
         // Residual 1: d_res1_out branches into d_in and d_proj_out
         // Proj Backward (zero-copy branch directly reading grads.d_res1_out)
         NVTX_PUSH("Attn_Out_Bwd");
-        matmul_forward(cublas_handle, la.head_merged, grads.d_res1_out, d_lp.proj_w, C, C, B * T, true, false, 1.0f, 0.0f, stream);
+        if (cublaslt_handle != nullptr) {
+            matmul_cublaslt(
+                cublaslt_handle,
+                la.head_merged, grads.d_res1_out, d_lp.proj_w,
+                C, C, B * T,
+                CUBLASLT_EPILOGUE_DEFAULT, nullptr,
+                d_cublaslt_workspace, cublaslt_workspace_size,
+                true, false, 1.0f, 0.0f, stream
+            );
+        } else {
+            matmul_forward(cublas_handle, la.head_merged, grads.d_res1_out, d_lp.proj_w, C, C, B * T, true, false, 1.0f, 0.0f, stream);
+        }
         bias_backward(grads.d_res1_out, d_lp.proj_b, B * T, C, stream);
         matmul_forward(cublas_handle, grads.d_res1_out, lp.proj_w, grads.d_head_merged, B * T, C, C, false, true, 1.0f, 0.0f, stream);
         head_merge_transpose_backward(grads.d_head_merged, grads.d_attn_out, B, H, T, d_head, stream);
@@ -513,20 +558,30 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
 
         // QKV Projection Backward
         NVTX_PUSH("QKV_Proj_Bwd");
-        matmul_forward(cublas_handle, la.ln1_out, grads.d_qkv, d_lp.qkv_w, C, 3 * C, B * T, true, false, 1.0f, 0.0f, stream);
+        if (cublaslt_handle != nullptr) {
+            matmul_cublaslt(
+                cublaslt_handle,
+                la.ln1_out, grads.d_qkv, d_lp.qkv_w,
+                C, 3 * C, B * T,
+                CUBLASLT_EPILOGUE_DEFAULT, nullptr,
+                d_cublaslt_workspace, cublaslt_workspace_size,
+                true, false, 1.0f, 0.0f, stream
+            );
+        } else {
+            matmul_forward(cublas_handle, la.ln1_out, grads.d_qkv, d_lp.qkv_w, C, 3 * C, B * T, true, false, 1.0f, 0.0f, stream);
+        }
         bias_backward(grads.d_qkv, d_lp.qkv_b, B * T, 3 * C, stream);
         matmul_forward(cublas_handle, grads.d_qkv, lp.qkv_w, grads.d_ln1_out, B * T, C, 3 * C, false, true, 1.0f, 0.0f, stream);
         NVTX_POP();
 
-        // LayerNorm 1 Backward
+        // LayerNorm 1 Backward: fuses residual add directly into grads.d_block_out
         NVTX_PUSH("LN1_Bwd");
         layernorm_backward(
             grads.d_ln1_out, block_input, lp.ln1_gamma,
             la.ln1_mean, la.ln1_rstd,
-            grads.d_emb_out, d_lp.ln1_gamma, d_lp.ln1_beta,
-            B * T, C, stream
+            grads.d_block_out, d_lp.ln1_gamma, d_lp.ln1_beta,
+            B * T, C, grads.d_res1_out, false, stream
         );
-        residual_add(grads.d_res1_out, grads.d_emb_out, grads.d_block_out, B * T * C, stream);
         NVTX_POP();
 
         NVTX_POP(); // Layer_Bwd

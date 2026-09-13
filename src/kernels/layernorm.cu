@@ -151,7 +151,9 @@ __global__ void layernorm_backward_dx_kernel(
     const float* __restrict__ mean_cache,
     const float* __restrict__ rstd_cache,
     float* __restrict__ dx,
-    int N, int C
+    int N, int C,
+    const float* __restrict__ residual_add,
+    bool accumulate
 ) {
     int row = blockIdx.x;
     if (row >= N) return;
@@ -159,6 +161,7 @@ __global__ void layernorm_backward_dx_kernel(
     const float* dout_row = dout + row * C;
     const float* x_row = x + row * C;
     float* dx_row = dx + row * C;
+    const float* res_row = residual_add ? (residual_add + row * C) : nullptr;
 
     float mean = mean_cache[row];
     float rstd = rstd_cache[row];
@@ -194,11 +197,19 @@ __global__ void layernorm_backward_dx_kernel(
         float g = gamma ? gamma[i] : 1.0f;
         float dy = dout_row[i];
         float x_hat = (x_row[i] - mean) * rstd;
-        dx_row[i] = rstd * (dy * g - inv_C * s1 - inv_C * x_hat * s2 * rstd);
+        float val = rstd * (dy * g - inv_C * s1 - inv_C * x_hat * s2 * rstd);
+        if (res_row != nullptr) {
+            val += res_row[i];
+        }
+        if (accumulate) {
+            dx_row[i] += val;
+        } else {
+            dx_row[i] = val;
+        }
     }
 }
 
-// LayerNorm Backward Kernel for dgamma and dbeta
+// LayerNorm Backward Kernel for dgamma and dbeta (2D Grid across rows to saturate GPU SMs)
 __global__ void layernorm_backward_params_kernel(
     const float* __restrict__ dout,
     const float* __restrict__ x,
@@ -209,12 +220,18 @@ __global__ void layernorm_backward_params_kernel(
     int N, int C
 ) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int chunk_id = blockIdx.y;
+    int num_chunks = gridDim.y;
     if (col >= C) return;
+
+    int rows_per_chunk = (N + num_chunks - 1) / num_chunks;
+    int start_row = chunk_id * rows_per_chunk;
+    int end_row = min(N, start_row + rows_per_chunk);
 
     float dg = 0.0f;
     float db = 0.0f;
 
-    for (int row = 0; row < N; ++row) {
+    for (int row = start_row; row < end_row; ++row) {
         float dy = dout[row * C + col];
         float mean = mean_cache[row];
         float rstd = rstd_cache[row];
@@ -223,8 +240,13 @@ __global__ void layernorm_backward_params_kernel(
         db += dy;
     }
 
-    if (dgamma) dgamma[col] += dg;
-    if (dbeta)  dbeta[col]  += db;
+    if (num_chunks == 1) {
+        if (dgamma) dgamma[col] += dg;
+        if (dbeta)  dbeta[col]  += db;
+    } else {
+        if (dgamma) atomicAdd(&dgamma[col], dg);
+        if (dbeta)  atomicAdd(&dbeta[col], db);
+    }
 }
 
 void layernorm_forward(
@@ -262,17 +284,19 @@ void layernorm_backward(
     float* dgamma,
     float* dbeta,
     int N, int C,
+    const float* residual_add,
+    bool accumulate,
     cudaStream_t stream
 ) {
     int threads = (C >= 1024) ? 1024 : ((C >= 512) ? 512 : 256);
     size_t shared_size = (threads / WARP_SIZE) * sizeof(float);
 
     layernorm_backward_dx_kernel<<<N, threads, shared_size, stream>>>(
-        dout, x, gamma, mean, rstd, dx, N, C
+        dout, x, gamma, mean, rstd, dx, N, C, residual_add, accumulate
     );
 
     int block_dim = 256;
-    int grid_dim = (C + block_dim - 1) / block_dim;
+    dim3 grid_dim((C + block_dim - 1) / block_dim, 16);
     layernorm_backward_params_kernel<<<grid_dim, block_dim, 0, stream>>>(
         dout, x, mean, rstd, dgamma, dbeta, N, C
     );
