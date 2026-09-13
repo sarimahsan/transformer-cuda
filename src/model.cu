@@ -393,13 +393,12 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
 
         // Residual 2: d_block_out branches into d_res1_out and d_ffn2_out
         CUDA_CHECK(cudaMemcpyAsync(grads.d_res1_out, grads.d_block_out, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(grads.d_ffn2_out, grads.d_block_out, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 
-        // FFN2 Backward
+        // FFN2 Backward (zero-copy branch directly reading grads.d_block_out)
         NVTX_PUSH("FFN2_Bwd");
-        matmul_forward(cublas_handle, la.ffn_gelu, grads.d_ffn2_out, d_lp.ffn2_w, d_ff, C, B * T, true, false, 1.0f, 0.0f, stream);
-        bias_backward(grads.d_ffn2_out, d_lp.ffn2_b, B * T, C, stream);
-        matmul_forward(cublas_handle, grads.d_ffn2_out, lp.ffn2_w, grads.d_ffn_gelu, B * T, d_ff, C, false, true, 1.0f, 0.0f, stream);
+        matmul_forward(cublas_handle, la.ffn_gelu, grads.d_block_out, d_lp.ffn2_w, d_ff, C, B * T, true, false, 1.0f, 0.0f, stream);
+        bias_backward(grads.d_block_out, d_lp.ffn2_b, B * T, C, stream);
+        matmul_forward(cublas_handle, grads.d_block_out, lp.ffn2_w, grads.d_ffn_gelu, B * T, d_ff, C, false, true, 1.0f, 0.0f, stream);
         NVTX_POP();
 
         // GELU Backward
@@ -426,13 +425,11 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
         NVTX_POP();
 
         // Residual 1: d_res1_out branches into d_in and d_proj_out
-        CUDA_CHECK(cudaMemcpyAsync(grads.d_proj_out, grads.d_res1_out, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-
-        // Proj Backward
+        // Proj Backward (zero-copy branch directly reading grads.d_res1_out)
         NVTX_PUSH("Attn_Out_Bwd");
-        matmul_forward(cublas_handle, la.head_merged, grads.d_proj_out, d_lp.proj_w, C, C, B * T, true, false, 1.0f, 0.0f, stream);
-        bias_backward(grads.d_proj_out, d_lp.proj_b, B * T, C, stream);
-        matmul_forward(cublas_handle, grads.d_proj_out, lp.proj_w, grads.d_head_merged, B * T, C, C, false, true, 1.0f, 0.0f, stream);
+        matmul_forward(cublas_handle, la.head_merged, grads.d_res1_out, d_lp.proj_w, C, C, B * T, true, false, 1.0f, 0.0f, stream);
+        bias_backward(grads.d_res1_out, d_lp.proj_b, B * T, C, stream);
+        matmul_forward(cublas_handle, grads.d_res1_out, lp.proj_w, grads.d_head_merged, B * T, C, C, false, true, 1.0f, 0.0f, stream);
         head_merge_transpose_backward(grads.d_head_merged, grads.d_attn_out, B, H, T, d_head, stream);
         NVTX_POP();
 

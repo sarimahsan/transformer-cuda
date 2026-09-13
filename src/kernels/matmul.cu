@@ -98,19 +98,23 @@ void add_bias(
     add_bias_kernel<<<grid_dim, block_dim, 0, stream>>>(Y, bias, M, N);
 }
 
-__global__ void bias_backward_kernel(
+__global__ void bias_backward_2d_kernel(
     const float* __restrict__ dY,
     float* __restrict__ dbias,
     int M, int N
 ) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row_start = blockIdx.y * blockDim.y + threadIdx.y;
+    int row_stride = gridDim.y * blockDim.y;
+
     if (col >= N) return;
 
     float sum = 0.0f;
-    for (int row = 0; row < M; ++row) {
+    for (int row = row_start; row < M; row += row_stride) {
         sum += dY[row * N + col];
     }
-    dbias[col] += sum;
+
+    atomicAdd(&dbias[col], sum);
 }
 
 void bias_backward(
@@ -119,7 +123,9 @@ void bias_backward(
     int M, int N,
     cudaStream_t stream
 ) {
-    int block_dim = 256;
-    int grid_dim = (N + block_dim - 1) / block_dim;
-    bias_backward_kernel<<<grid_dim, block_dim, 0, stream>>>(dY, dbias, M, N);
+    dim3 block_dim(32, 8); // 256 threads per block, 32 coalesced columns per warp
+    int num_row_blocks = (M >= 1024) ? 32 : ((M >= 256) ? 16 : 1);
+    dim3 grid_dim((N + block_dim.x - 1) / block_dim.x, num_row_blocks);
+
+    bias_backward_2d_kernel<<<grid_dim, block_dim, 0, stream>>>(dY, dbias, M, N);
 }

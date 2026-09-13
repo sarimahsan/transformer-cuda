@@ -97,20 +97,52 @@ __global__ void causal_softmax_fwd_kernel(
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
 
+    extern __shared__ float s_data[];
+    int lane = tid % WARP_SIZE;
+    int wid = tid / WARP_SIZE;
+    int num_warps = (nthreads + WARP_SIZE - 1) / WARP_SIZE;
+
+    // Single-pass register-cached path when T <= nthreads (true for standard T <= 512)
+    if (T <= nthreads) {
+        float s_val = (tid <= i && tid < T) ? (s_row[tid] * scale) : -FLT_MAX;
+        float max_val = warp_reduce_max(s_val);
+        if (lane == 0) s_data[wid] = max_val;
+        __syncthreads();
+
+        max_val = (tid < num_warps) ? s_data[lane] : -FLT_MAX;
+        if (wid == 0) max_val = warp_reduce_max(max_val);
+        if (tid == 0) s_data[0] = max_val;
+        __syncthreads();
+        max_val = s_data[0];
+
+        float e = (tid <= i && tid < T) ? expf(s_val - max_val) : 0.0f;
+        float sum_exp = warp_reduce_sum(e);
+        if (lane == 0) s_data[wid] = sum_exp;
+        __syncthreads();
+
+        sum_exp = (tid < num_warps) ? s_data[lane] : 0.0f;
+        if (wid == 0) sum_exp = warp_reduce_sum(sum_exp);
+        if (tid == 0) s_data[0] = sum_exp;
+        __syncthreads();
+        sum_exp = s_data[0];
+
+        float inv_sum = 1.0f / (sum_exp + 1e-12f);
+        if (tid < T) {
+            p_row[tid] = (tid <= i) ? (e * inv_sum) : 0.0f;
+        }
+        return;
+    }
+
+    // General fallback for T > nthreads
     // 1. Find max for numerical stability over j <= i
     float max_val = -FLT_MAX;
     for (int j = tid; j <= i; j += nthreads) {
         max_val = fmaxf(max_val, s_row[j] * scale);
     }
     max_val = warp_reduce_max(max_val);
-
-    extern __shared__ float s_data[];
-    int lane = tid % WARP_SIZE;
-    int wid = tid / WARP_SIZE;
     if (lane == 0) s_data[wid] = max_val;
     __syncthreads();
 
-    int num_warps = (nthreads + WARP_SIZE - 1) / WARP_SIZE;
     max_val = (tid < num_warps) ? s_data[lane] : -FLT_MAX;
     if (wid == 0) max_val = warp_reduce_max(max_val);
     if (tid == 0) s_data[0] = max_val;
@@ -162,20 +194,41 @@ __global__ void causal_softmax_bwd_kernel(
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
 
-    // sum(dprobs * probs)
+    extern __shared__ float s_data[];
+    int lane = tid % WARP_SIZE;
+    int wid = tid / WARP_SIZE;
+    int num_warps = (nthreads + WARP_SIZE - 1) / WARP_SIZE;
+
+    // Single-pass register-cached path when T <= nthreads (no re-reading DRAM!)
+    if (T <= nthreads) {
+        float p_val = (tid <= i && tid < T) ? p_row[tid] : 0.0f;
+        float dp_val = (tid <= i && tid < T) ? dp_row[tid] : 0.0f;
+        float dot = p_val * dp_val;
+        dot = warp_reduce_sum(dot);
+        if (lane == 0) s_data[wid] = dot;
+        __syncthreads();
+
+        dot = (tid < num_warps) ? s_data[lane] : 0.0f;
+        if (wid == 0) dot = warp_reduce_sum(dot);
+        if (tid == 0) s_data[0] = dot;
+        __syncthreads();
+        dot = s_data[0];
+
+        if (tid < T) {
+            ds_row[tid] = (tid <= i) ? (scale * p_val * (dp_val - dot)) : 0.0f;
+        }
+        return;
+    }
+
+    // General fallback for T > nthreads
     float dot = 0.0f;
     for (int j = tid; j <= i; j += nthreads) {
         dot += dp_row[j] * p_row[j];
     }
     dot = warp_reduce_sum(dot);
-
-    extern __shared__ float s_data[];
-    int lane = tid % WARP_SIZE;
-    int wid = tid / WARP_SIZE;
     if (lane == 0) s_data[wid] = dot;
     __syncthreads();
 
-    int num_warps = (nthreads + WARP_SIZE - 1) / WARP_SIZE;
     dot = (tid < num_warps) ? s_data[lane] : 0.0f;
     if (wid == 0) dot = warp_reduce_sum(dot);
     if (tid == 0) s_data[0] = dot;
@@ -317,14 +370,14 @@ void head_merge_transpose_backward(
 }
 
 // FlashAttention-Style Tiled Causal Attention Forward Kernel
-// Br: Query tile size (blockDim.x), Bc: Key/Value tile size (shared memory)
-template <int Bc>
+// Br: Query tile size (blockDim.x), Bc: Key/Value tile size (shared memory), Dh: Head dimension compile-time constant
+template <int Bc, int Dh>
 __global__ void tiled_causal_attention_fwd_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,
     float* __restrict__ out,
-    int B, int H, int T, int d_head,
+    int B, int H, int T,
     float scale,
     int Br
 ) {
@@ -332,26 +385,26 @@ __global__ void tiled_causal_attention_fwd_kernel(
     int query_tile_idx = blockIdx.x;
     int i = query_tile_idx * Br + threadIdx.x; // query sequence position
 
-    int head_stride = T * d_head;
+    int head_stride = T * Dh;
     const float* q_head = q + bh * head_stride;
     const float* k_head = k + bh * head_stride;
     const float* v_head = v + bh * head_stride;
     float* out_head = out + bh * head_stride;
 
     extern __shared__ float smem[];
-    float* s_k = smem;                // size: Bc * d_head
-    float* s_v = smem + Bc * d_head;  // size: Bc * d_head
+    float* s_k = smem;             // size: Bc * Dh
+    float* s_v = smem + Bc * Dh;   // size: Bc * Dh
 
-    // Thread-local registers
-    float q_reg[128];
-    float o_reg[128];
+    // Thread-local hardware registers (fully unrolled, zero local memory spill)
+    float q_reg[Dh];
+    float o_reg[Dh];
     float m_i = -FLT_MAX;
     float l_i = 0.0f;
 
     if (i < T) {
-        #pragma unroll 4
-        for (int d = 0; d < d_head; ++d) {
-            q_reg[d] = q_head[i * d_head + d];
+        #pragma unroll
+        for (int d = 0; d < Dh; ++d) {
+            q_reg[d] = q_head[i * Dh + d];
             o_reg[d] = 0.0f;
         }
     }
@@ -364,14 +417,14 @@ __global__ void tiled_causal_attention_fwd_kernel(
         if (c * Bc > max_query_in_tile) break;
 
         // Cooperatively load K and V tile into Shared Memory
-        int total_kv_elements = Bc * d_head;
+        int total_kv_elements = Bc * Dh;
         for (int idx = threadIdx.x; idx < total_kv_elements; idx += blockDim.x) {
-            int k_t = idx / d_head;
-            int k_d = idx % d_head;
+            int k_t = idx / Dh;
+            int k_d = idx % Dh;
             int global_k_pos = c * Bc + k_t;
             if (global_k_pos < T) {
-                s_k[idx] = k_head[global_k_pos * d_head + k_d];
-                s_v[idx] = v_head[global_k_pos * d_head + k_d];
+                s_k[idx] = k_head[global_k_pos * Dh + k_d];
+                s_v[idx] = v_head[global_k_pos * Dh + k_d];
             } else {
                 s_k[idx] = 0.0f;
                 s_v[idx] = 0.0f;
@@ -386,12 +439,12 @@ __global__ void tiled_causal_attention_fwd_kernel(
 
             for (int j = start_j; j <= max_j; ++j) {
                 int j_rel = j - start_j;
-                const float* k_vec = s_k + j_rel * d_head;
-                const float* v_vec = s_v + j_rel * d_head;
+                const float* k_vec = s_k + j_rel * Dh;
+                const float* v_vec = s_v + j_rel * Dh;
 
                 float score = 0.0f;
-                #pragma unroll 4
-                for (int d = 0; d < d_head; ++d) {
+                #pragma unroll
+                for (int d = 0; d < Dh; ++d) {
                     score += q_reg[d] * k_vec[d];
                 }
                 score *= scale;
@@ -402,8 +455,8 @@ __global__ void tiled_causal_attention_fwd_kernel(
                 float beta = expf(score - m_new);
                 l_i = l_i * alpha + beta;
 
-                #pragma unroll 4
-                for (int d = 0; d < d_head; ++d) {
+                #pragma unroll
+                for (int d = 0; d < Dh; ++d) {
                     o_reg[d] = o_reg[d] * alpha + beta * v_vec[d];
                 }
                 m_i = m_new;
@@ -415,9 +468,9 @@ __global__ void tiled_causal_attention_fwd_kernel(
     // Write final normalized outputs to global memory
     if (i < T) {
         float inv_l = (l_i > 0.0f) ? (1.0f / (l_i + 1e-12f)) : 0.0f;
-        #pragma unroll 4
-        for (int d = 0; d < d_head; ++d) {
-            out_head[i * d_head + d] = o_reg[d] * inv_l;
+        #pragma unroll
+        for (int d = 0; d < Dh; ++d) {
+            out_head[i * Dh + d] = o_reg[d] * inv_l;
         }
     }
 }
@@ -437,7 +490,17 @@ void tiled_causal_attention_forward(
     dim3 block(Br);
 
     size_t shared_mem_bytes = 2 * Bc * d_head * sizeof(float);
-    tiled_causal_attention_fwd_kernel<Bc><<<grid, block, shared_mem_bytes, stream>>>(
-        q, k, v, out, B, H, T, d_head, scale, Br
-    );
+    if (d_head == 32) {
+        tiled_causal_attention_fwd_kernel<Bc, 32><<<grid, block, shared_mem_bytes, stream>>>(
+            q, k, v, out, B, H, T, scale, Br
+        );
+    } else if (d_head == 64) {
+        tiled_causal_attention_fwd_kernel<Bc, 64><<<grid, block, shared_mem_bytes, stream>>>(
+            q, k, v, out, B, H, T, scale, Br
+        );
+    } else {
+        tiled_causal_attention_fwd_kernel<Bc, 128><<<grid, block, shared_mem_bytes, stream>>>(
+            q, k, v, out, B, H, T, scale, Br
+        );
+    }
 }
