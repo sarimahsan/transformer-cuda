@@ -39,6 +39,31 @@ void matmul_forward(
     ));
 }
 
+#include <map>
+
+struct CublasLtPlanKey {
+    int M, N, K;
+    bool transA, transB;
+    int epilogue;
+    bool operator<(const CublasLtPlanKey& o) const {
+        if (M != o.M) return M < o.M;
+        if (N != o.N) return N < o.N;
+        if (K != o.K) return K < o.K;
+        if (transA != o.transA) return transA < o.transA;
+        if (transB != o.transB) return transB < o.transB;
+        return epilogue < o.epilogue;
+    }
+};
+
+struct CublasLtCachedPlan {
+    cublasLtMatmulDesc_t opDesc;
+    cublasLtMatrixLayout_t layA, layB, layC;
+    cublasLtMatmulAlgo_t algo;
+    bool hasAlgo;
+};
+
+static std::map<CublasLtPlanKey, CublasLtCachedPlan> g_cublaslt_plan_cache;
+
 void matmul_cublaslt(
     cublasLtHandle_t lt_handle,
     const float* A,
@@ -55,103 +80,89 @@ void matmul_cublaslt(
     float beta,
     cudaStream_t stream
 ) {
-    cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
-    cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+    CublasLtPlanKey key{M, N, K, transA, transB, (int)epilogue};
+    auto it = g_cublaslt_plan_cache.find(key);
 
-    int lda = transA ? M : K;
-    int ldb = transB ? K : N;
-    int ldc = N;
+    if (it == g_cublaslt_plan_cache.end()) {
+        // First call for this config: create and cache the full plan
+        CublasLtCachedPlan plan;
 
-    cublasLtMatmulDesc_t operationDesc = NULL;
-    cublasLtMatrixLayout_t layoutB = NULL;
-    cublasLtMatrixLayout_t layoutA = NULL;
-    cublasLtMatrixLayout_t layoutC = NULL;
+        cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+        cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+        int lda = transA ? M : K;
+        int ldb = transB ? K : N;
+        int ldc = N;
 
-    cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opB, sizeof(opB));
-    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opA, sizeof(opA));
+        cublasLtMatmulDescCreate(&plan.opDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+        cublasLtMatmulDescSetAttribute(plan.opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opB, sizeof(opB));
+        cublasLtMatmulDescSetAttribute(plan.opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opA, sizeof(opA));
 
-    if (epilogue != CUBLASLT_EPILOGUE_DEFAULT) {
-        cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue));
-        if (bias != nullptr) {
-            cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias));
+        if (epilogue != CUBLASLT_EPILOGUE_DEFAULT) {
+            cublasLtMatmulDescSetAttribute(plan.opDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue));
         }
-    }
 
-    int rowsB = transB ? K : N;
-    int colsB = transB ? N : K;
-    cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_32F, rowsB, colsB, ldb);
+        int rowsB = transB ? K : N;
+        int colsB = transB ? N : K;
+        cublasLtMatrixLayoutCreate(&plan.layB, CUDA_R_32F, rowsB, colsB, ldb);
 
-    int rowsA = transA ? M : K;
-    int colsA = transA ? K : M;
-    cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_32F, rowsA, colsA, lda);
+        int rowsA = transA ? M : K;
+        int colsA = transA ? K : M;
+        cublasLtMatrixLayoutCreate(&plan.layA, CUDA_R_32F, rowsA, colsA, lda);
 
-    cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_32F, N, M, ldc);
+        cublasLtMatrixLayoutCreate(&plan.layC, CUDA_R_32F, N, M, ldc);
 
-    cublasLtMatmulPreference_t preference = NULL;
-    cublasLtMatmulPreferenceCreate(&preference);
-    if (workspace != nullptr && workspace_size > 0) {
-        cublasLtMatmulPreferenceSetAttribute(
-            preference,
-            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-            &workspace_size,
-            sizeof(workspace_size)
+        // Query heuristic once and cache the algorithm
+        cublasLtMatmulPreference_t preference = NULL;
+        cublasLtMatmulPreferenceCreate(&preference);
+        if (workspace != nullptr && workspace_size > 0) {
+            cublasLtMatmulPreferenceSetAttribute(
+                preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &workspace_size, sizeof(workspace_size)
+            );
+        }
+
+        cublasLtMatmulHeuristicResult_t heuristicResult = {};
+        int returnedResults = 0;
+        cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
+            lt_handle, plan.opDesc, plan.layB, plan.layA, plan.layC, plan.layC,
+            preference, 1, &heuristicResult, &returnedResults
         );
+
+        plan.hasAlgo = (status == CUBLAS_STATUS_SUCCESS && returnedResults > 0);
+        if (plan.hasAlgo) {
+            plan.algo = heuristicResult.algo;
+        }
+
+        cublasLtMatmulPreferenceDestroy(preference);
+
+        g_cublaslt_plan_cache[key] = plan;
+        it = g_cublaslt_plan_cache.find(key);
     }
 
-    cublasLtMatmulHeuristicResult_t heuristicResult = {};
-    int returnedResults = 0;
-    cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
-        lt_handle,
-        operationDesc,
-        layoutB,
-        layoutA,
-        layoutC,
-        layoutC,
-        preference,
-        1,
-        &heuristicResult,
-        &returnedResults
-    );
+    CublasLtCachedPlan& plan = it->second;
 
-    if (status == CUBLAS_STATUS_SUCCESS && returnedResults > 0) {
+    // Update bias pointer per-call (only for EPILOGUE_BIAS)
+    if (bias != nullptr) {
+        cublasLtMatmulDescSetAttribute(plan.opDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias));
+    }
+
+    if (plan.hasAlgo) {
         cublasLtMatmul(
-            lt_handle,
-            operationDesc,
-            &alpha,
-            B, layoutB,
-            A, layoutA,
-            &beta,
-            C, layoutC,
-            C, layoutC,
-            &heuristicResult.algo,
-            workspace,
-            workspace_size,
-            stream
+            lt_handle, plan.opDesc, &alpha,
+            B, plan.layB, A, plan.layA, &beta,
+            C, plan.layC, C, plan.layC,
+            &plan.algo, workspace, workspace_size, stream
         );
     } else {
         cublasLtMatmul(
-            lt_handle,
-            operationDesc,
-            &alpha,
-            B, layoutB,
-            A, layoutA,
-            &beta,
-            C, layoutC,
-            C, layoutC,
-            NULL,
-            workspace,
-            workspace_size,
-            stream
+            lt_handle, plan.opDesc, &alpha,
+            B, plan.layB, A, plan.layA, &beta,
+            C, plan.layC, C, plan.layC,
+            NULL, workspace, workspace_size, stream
         );
     }
-
-    if (preference) cublasLtMatmulPreferenceDestroy(preference);
-    if (layoutC) cublasLtMatrixLayoutDestroy(layoutC);
-    if (layoutA) cublasLtMatrixLayoutDestroy(layoutA);
-    if (layoutB) cublasLtMatrixLayoutDestroy(layoutB);
-    if (operationDesc) cublasLtMatmulDescDestroy(operationDesc);
 }
+
 
 void matmul_batched_strided(
     cublasHandle_t handle,

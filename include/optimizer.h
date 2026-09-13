@@ -12,6 +12,7 @@ public:
     void step(float lr, cudaStream_t stream = 0);
     void zero_grad(cudaStream_t stream = 0);
     float clip_grad_norm(float max_norm, cudaStream_t stream = 0);
+    void fused_step(float lr, float max_norm, cudaStream_t stream = 0);
     void reset();
 
     size_t get_step_count() const { return step_count; }

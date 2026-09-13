@@ -114,6 +114,45 @@ __global__ void scale_grads_device_kernel(
     }
 }
 
+__global__ void fused_clip_adamw_zero_kernel(
+    float* __restrict__ params,
+    float* __restrict__ grads,
+    float* __restrict__ m,
+    float* __restrict__ v,
+    const float* __restrict__ d_total_norm,
+    size_t num_params,
+    float lr, float beta1, float beta2, float eps,
+    float weight_decay, float max_norm,
+    float bias_correction1, float bias_correction2
+) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_params) return;
+
+    float norm = *d_total_norm;
+    float g = grads[idx];
+
+    // Clip gradient in-register
+    if (norm > max_norm && norm > 1e-6f) {
+        g *= max_norm / norm;
+    }
+
+    float p = params[idx];
+
+    // AdamW update
+    float m_t = beta1 * m[idx] + (1.0f - beta1) * g;
+    m[idx] = m_t;
+    float v_t = beta2 * v[idx] + (1.0f - beta2) * g * g;
+    v[idx] = v_t;
+
+    float m_hat = m_t / bias_correction1;
+    float v_hat = v_t / bias_correction2;
+    p = p - lr * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * p);
+    params[idx] = p;
+
+    // Zero gradient
+    grads[idx] = 0.0f;
+}
+
 AdamW::AdamW(float* params, float* grads, size_t num_params, const TransformerConfig& config)
     : d_params(params),
       d_grads(grads),
@@ -182,3 +221,30 @@ void AdamW::step(float lr, cudaStream_t stream) {
     );
     NVTX_POP();
 }
+
+void AdamW::fused_step(float lr, float max_norm, cudaStream_t stream) {
+    NVTX_PUSH("Fused_Clip_AdamW_Zero");
+    step_count++;
+    float bias_correction1 = 1.0f - powf(beta1, (float)step_count);
+    float bias_correction2 = 1.0f - powf(beta2, (float)step_count);
+
+    int block_dim = 256;
+    int grid_dim = (num_params + block_dim - 1) / block_dim;
+    size_t shared_size = (block_dim / WARP_SIZE) * sizeof(float);
+
+    float* d_block_sums = d_norm_buffer;
+    float* d_total_norm = d_norm_buffer + grid_dim;
+
+    // Stage 1: Per-block squared gradient norm reduction
+    sum_sq_kernel<<<grid_dim, block_dim, shared_size, stream>>>(d_grads, d_block_sums, num_params);
+    // Stage 2: Final reduction to scalar norm
+    reduce_total_norm_kernel<<<1, 256, (256 / WARP_SIZE) * sizeof(float), stream>>>(d_block_sums, grid_dim, d_total_norm);
+    // Stage 3: Fused clip + AdamW update + zero grad (single pass over gradient buffer)
+    fused_clip_adamw_zero_kernel<<<grid_dim, block_dim, 0, stream>>>(
+        d_params, d_grads, d_m, d_v, d_total_norm, num_params,
+        lr, beta1, beta2, eps, weight_decay, max_norm,
+        bias_correction1, bias_correction2
+    );
+    NVTX_POP();
+}
+

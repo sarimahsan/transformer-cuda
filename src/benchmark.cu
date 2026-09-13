@@ -131,9 +131,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < warmup_steps; ++i) {
         model.forward(d_tokens);
         model.backward(d_tokens, d_targets, &host_loss);
-        optimizer.clip_grad_norm(config.grad_clip);
-        optimizer.step(config.learning_rate);
-        optimizer.zero_grad();
+        optimizer.fused_step(config.learning_rate, config.grad_clip);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -159,9 +157,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal));
         model.forward(d_tokens, 0);
         model.backward(d_tokens, d_targets, nullptr, 0);
-        optimizer.clip_grad_norm(config.grad_clip, 0);
-        optimizer.step(config.learning_rate, 0);
-        optimizer.zero_grad(0);
+        optimizer.fused_step(config.learning_rate, config.grad_clip, 0);
         CUDA_CHECK(cudaStreamEndCapture(0, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
         if (!json_output) std::cout << "[Benchmark] CUDA Graph instantiated successfully.\n";
@@ -193,10 +189,8 @@ int main(int argc, char** argv) {
             model.backward(d_tokens, d_targets, loss_ptr, 0);
             CUDA_CHECK(cudaEventRecord(bwd_evt, 0));
 
-            // 3. Optimizer Step
-            optimizer.clip_grad_norm(config.grad_clip, 0);
-            optimizer.step(config.learning_rate, 0);
-            optimizer.zero_grad(0);
+            // 3. Optimizer Step (fused clip + AdamW + zero_grad in a single pass)
+            optimizer.fused_step(config.learning_rate, config.grad_clip, 0);
             CUDA_CHECK(cudaEventRecord(stop_evt, 0));
 
             CUDA_CHECK(cudaEventSynchronize(stop_evt));

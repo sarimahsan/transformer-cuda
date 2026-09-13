@@ -119,7 +119,7 @@ void TransformerModel::allocate_memory() {
     CUDA_CHECK(cudaMalloc(&grads.d_attn_d_scratch, B * H * T * sizeof(float)));
 
     // 4. cuBLASLt Workspace
-    cublaslt_workspace_size = 4 * 1024 * 1024; // 4 MB
+    cublaslt_workspace_size = 32 * 1024 * 1024; // 32 MB
     CUDA_CHECK(cudaMalloc(&d_cublaslt_workspace, cublaslt_workspace_size));
 }
 
@@ -486,8 +486,9 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
         LayerActivations& la = acts.layers[l];
         const float* block_input = (l > 0) ? acts.layers[l - 1].block_out : acts.emb_out;
 
-        // Residual 2: d_block_out branches into d_res1_out and d_ffn2_out
-        CUDA_CHECK(cudaMemcpyAsync(grads.d_res1_out, grads.d_block_out, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        // Residual 2: d_block_out gradient flows through both FFN branch and residual skip
+        // The residual branch is fused into LN2 backward via residual_add parameter,
+        // eliminating a separate D2D memcpy per layer.
 
         // FFN2 Backward (zero-copy branch directly reading grads.d_block_out)
         NVTX_PUSH("FFN2_Bwd");
@@ -558,7 +559,7 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
             grads.d_ln2_out, la.res1_out, lp.ln2_gamma,
             la.ln2_mean, la.ln2_rstd,
             grads.d_res1_out, d_lp.ln2_gamma, d_lp.ln2_beta,
-            B * T, C, nullptr, true, stream
+            B * T, C, grads.d_block_out, false, stream
         );
         NVTX_POP();
 
