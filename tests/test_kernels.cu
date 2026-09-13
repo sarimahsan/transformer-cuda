@@ -119,6 +119,133 @@ bool test_causal_softmax() {
     return true;
 }
 
+bool test_fused_add_bias_gelu() {
+    std::cout << "[Test] Running Fused AddBias+GELU kernel verification...";
+    int M = 16;
+    int N = 64; // multiple of 4 for float4 vectorization
+    int total = M * N;
+
+    std::vector<float> h_x(total);
+    std::vector<float> h_bias(N);
+    std::vector<float> h_out(total);
+    std::vector<float> h_ref(total);
+
+    for (int i = 0; i < total; ++i) h_x[i] = (i % 50 - 25) * 0.05f;
+    for (int j = 0; j < N; ++j) h_bias[j] = (j % 10 - 5) * 0.02f;
+
+    // Reference compute
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            float val = h_x[m * N + n] + h_bias[n];
+            float u = 0.7978845608028654f * (val + 0.044715f * val * val * val);
+            float t = std::tanh(u);
+            h_ref[m * N + n] = 0.5f * val * (1.0f + t);
+        }
+    }
+
+    float *d_x, *d_bias, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_x, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_bias, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_out, total * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_x, h_x.data(), total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_bias, h_bias.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+
+    add_bias_gelu_forward(d_x, d_bias, d_out, M, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, total * sizeof(float), cudaMemcpyDeviceToHost));
+
+    for (int i = 0; i < total; ++i) {
+        float diff = std::fabs(h_out[i] - h_ref[i]);
+        assert(diff < 1e-4f);
+    }
+
+    cudaFree(d_x);
+    cudaFree(d_bias);
+    cudaFree(d_out);
+
+    std::cout << " PASSED\n";
+    return true;
+}
+
+bool test_fused_add_bias_residual() {
+    std::cout << "[Test] Running Fused AddBias+Residual kernel verification...";
+    int M = 16;
+    int N = 64;
+    int total = M * N;
+
+    std::vector<float> h_res(total, 2.0f);
+    std::vector<float> h_in(total, 1.5f);
+    std::vector<float> h_bias(N, 0.25f);
+    std::vector<float> h_out(total, 0.0f);
+
+    float *d_res, *d_in, *d_bias, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_res, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_in, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_bias, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_out, total * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_res, h_res.data(), total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_bias, h_bias.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+
+    add_bias_residual(d_res, d_in, d_bias, d_out, M, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, total * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // 2.0 + 1.5 + 0.25 = 3.75
+    for (int i = 0; i < total; ++i) {
+        assert(std::fabs(h_out[i] - 3.75f) < 1e-5f);
+    }
+
+    cudaFree(d_res);
+    cudaFree(d_in);
+    cudaFree(d_bias);
+    cudaFree(d_out);
+
+    std::cout << " PASSED\n";
+    return true;
+}
+
+bool test_tiled_causal_attention() {
+    std::cout << "[Test] Running Tiled Causal Attention kernel verification...";
+    int B = 1, H = 1, T = 8, d_head = 32;
+    int total = B * H * T * d_head;
+
+    std::vector<float> h_q(total, 0.1f);
+    std::vector<float> h_k(total, 0.1f);
+    std::vector<float> h_v(total, 1.0f);
+    std::vector<float> h_out(total, 0.0f);
+
+    float *d_q, *d_k, *d_v, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_q, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_k, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_v, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_out, total * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), total * sizeof(float), cudaMemcpyHostToDevice));
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(d_head));
+    tiled_causal_attention_forward(d_q, d_k, d_v, d_out, B, H, T, d_head, scale);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, total * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // When V is all 1.0, convex combination sum(softmax_j * 1.0) == 1.0 for all queries
+    for (int i = 0; i < total; ++i) {
+        assert(std::fabs(h_out[i] - 1.0f) < 1e-3f);
+    }
+
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_out);
+
+    std::cout << " PASSED\n";
+    return true;
+}
+
 int main() {
     std::cout << "========================================\n";
     std::cout << " Isolated CUDA Kernel Test Suite\n";
@@ -126,6 +253,9 @@ int main() {
     test_layernorm();
     test_gelu();
     test_causal_softmax();
+    test_fused_add_bias_gelu();
+    test_fused_add_bias_residual();
+    test_tiled_causal_attention();
     std::cout << "========================================\n";
     std::cout << " All isolated kernel tests passed!\n";
     std::cout << "========================================\n";

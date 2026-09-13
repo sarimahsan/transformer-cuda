@@ -11,6 +11,17 @@ void gelu_forward(
     cudaStream_t stream = 0
 );
 
+// Fused Bias Addition + GELU Activation Forward:
+// y = GELU(x + bias) evaluated in-register using vectorized float4 memory access
+void add_bias_gelu_forward(
+    const float* x,
+    const float* bias,
+    float* y,
+    int M,
+    int N,
+    cudaStream_t stream = 0
+);
+
 // GELU Activation Backward:
 // dx = dy * gelu'(x)
 void gelu_backward(

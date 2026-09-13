@@ -144,16 +144,22 @@ def benchmark_framework(
                 optimizer.zero_grad(set_to_none=True)
 
                 # Forward
+                torch.cuda.nvtx.range_push("PyTorch_Forward")
                 logits, loss = model(x, y)
+                torch.cuda.nvtx.range_pop()
                 fwd_evt.record()
 
                 # Backward
+                torch.cuda.nvtx.range_push("PyTorch_Backward")
                 loss.backward()
+                torch.cuda.nvtx.range_pop()
                 bwd_evt.record()
 
                 # Optimizer
+                torch.cuda.nvtx.range_push("PyTorch_Optimizer")
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                torch.cuda.nvtx.range_pop()
                 stop_evt.record()
 
                 stop_evt.synchronize()

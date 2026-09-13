@@ -20,6 +20,7 @@ struct TransformerConfig {
     float beta2 = 0.999f;         // AdamW beta2
     float adam_eps = 1e-8f;       // AdamW epsilon
     float grad_clip = 1.0f;       // Gradient norm clipping threshold
+    bool use_tiled_attention = false; // FlashAttention-style tiled online softmax
 
     void validate() const {
         if (d_model % num_heads != 0) {

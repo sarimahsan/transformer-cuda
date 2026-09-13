@@ -27,18 +27,23 @@ set(CORE_SOURCES
     src/kernels/loss.cu
 )
 
+set(EXTRA_LIBS CUDA::cublas CUDA::cudart)
+if (TARGET CUDA::nvToolsExt)
+    list(APPEND EXTRA_LIBS CUDA::nvToolsExt)
+endif()
+
 # Executables
 add_executable(train src/main.cu ${CORE_SOURCES})
-target_link_libraries(train PRIVATE CUDA::cublas CUDA::cudart)
+target_link_libraries(train PRIVATE ${EXTRA_LIBS})
 
 add_executable(benchmark src/benchmark.cu ${CORE_SOURCES})
-target_link_libraries(benchmark PRIVATE CUDA::cublas CUDA::cudart)
+target_link_libraries(benchmark PRIVATE ${EXTRA_LIBS})
 
 add_executable(parity_audit src/parity_audit.cu ${CORE_SOURCES})
-target_link_libraries(parity_audit PRIVATE CUDA::cublas CUDA::cudart)
+target_link_libraries(parity_audit PRIVATE ${EXTRA_LIBS})
 
 add_executable(test_kernels tests/test_kernels.cu ${CORE_SOURCES})
-target_link_libraries(test_kernels PRIVATE CUDA::cublas CUDA::cudart)
+target_link_libraries(test_kernels PRIVATE ${EXTRA_LIBS})
 
 set_target_properties(train benchmark parity_audit test_kernels PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

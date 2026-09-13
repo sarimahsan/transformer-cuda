@@ -230,6 +230,7 @@ void TransformerModel::init_parameters(unsigned long long seed) {
 }
 
 void TransformerModel::forward(const int* d_tokens, cudaStream_t stream) {
+    NVTX_PUSH("Transformer_Forward");
     int B = static_cast<int>(config.batch_size);
     int T = static_cast<int>(config.max_seq_len);
     int C = static_cast<int>(config.d_model);
@@ -240,99 +241,119 @@ void TransformerModel::forward(const int* d_tokens, cudaStream_t stream) {
     int L = static_cast<int>(config.num_layers);
 
     // 1. Embedding
+    NVTX_PUSH("Embedding_Fwd");
     embedding_forward(d_tokens, params.token_emb, params.pos_emb, acts.emb_out, B, T, C, stream);
+    NVTX_POP();
 
     const float* curr_x = acts.emb_out;
 
     // 2. Transformer Blocks
     for (int l = 0; l < L; ++l) {
+        NVTX_PUSH("Layer_Fwd");
         LayerParameters& lp = params.layers[l];
         LayerActivations& la = acts.layers[l];
 
         // Pre-LN 1
+        NVTX_PUSH("LN1");
         layernorm_forward(
             curr_x, lp.ln1_gamma, lp.ln1_beta,
             la.ln1_out, la.ln1_mean, la.ln1_rstd,
             B * T, C, config.layernorm_eps, stream
         );
+        NVTX_POP();
 
         // QKV Projection: (B * T, C) x (C, 3 * C) -> (B * T, 3 * C)
+        NVTX_PUSH("QKV_Proj");
         matmul_forward(cublas_handle, la.ln1_out, lp.qkv_w, la.qkv, B * T, 3 * C, C, false, false, 1.0f, 0.0f, stream);
         add_bias(la.qkv, lp.qkv_b, B * T, 3 * C, stream);
+        NVTX_POP();
 
         // Split & Transpose QKV
+        NVTX_PUSH("Attention");
         qkv_split_transpose_forward(la.qkv, la.q, la.k, la.v, B, T, H, d_head, stream);
 
-        // Batched GEMM: Attention Scores = Q x K^T
-        // Q: (B * H, T, d_head), K: (B * H, T, d_head), Scores: (B * H, T, T)
-        matmul_batched_strided(
-            cublas_handle,
-            la.q, la.k, la.attn_scores,
-            T, T, d_head,
-            T * d_head, T * d_head, T * T,
-            B * H, false, true, 1.0f, 0.0f, stream
-        );
-
-        // Scaled Causal Softmax
         float scale = 1.0f / sqrtf(static_cast<float>(d_head));
-        causal_softmax_forward(la.attn_scores, la.attn_probs, B, H, T, scale, stream);
 
-        // Batched GEMM: Attention Output = Probs x V
-        // Probs: (B * H, T, T), V: (B * H, T, d_head), Out: (B * H, T, d_head)
-        matmul_batched_strided(
-            cublas_handle,
-            la.attn_probs, la.v, la.attn_out,
-            T, d_head, T,
-            T * T, T * d_head, T * d_head,
-            B * H, false, false, 1.0f, 0.0f, stream
-        );
+        if (config.use_tiled_attention) {
+            // FlashAttention-Style Tiled Online Softmax in SRAM/registers
+            tiled_causal_attention_forward(la.q, la.k, la.v, la.attn_out, B, H, T, d_head, scale, stream);
+        } else {
+            // Batched GEMM: Attention Scores = Q x K^T
+            matmul_batched_strided(
+                cublas_handle,
+                la.q, la.k, la.attn_scores,
+                T, T, d_head,
+                T * d_head, T * d_head, T * T,
+                B * H, false, true, 1.0f, 0.0f, stream
+            );
+
+            // Scaled Causal Softmax
+            causal_softmax_forward(la.attn_scores, la.attn_probs, B, H, T, scale, stream);
+
+            // Batched GEMM: Attention Output = Probs x V
+            matmul_batched_strided(
+                cublas_handle,
+                la.attn_probs, la.v, la.attn_out,
+                T, d_head, T,
+                T * T, T * d_head, T * d_head,
+                B * H, false, false, 1.0f, 0.0f, stream
+            );
+        }
 
         // Merge Heads Transpose: (B, H, T, d_head) -> (B, T, C)
         head_merge_transpose_forward(la.attn_out, la.head_merged, B, H, T, d_head, stream);
+        NVTX_POP();
 
-        // Out Projection: (B * T, C) x (C, C) -> (B * T, C)
+        // Out Projection & Fused Residual Add: res1 = curr_x + (proj_out + bias)
+        NVTX_PUSH("Attn_Out_Proj");
         matmul_forward(cublas_handle, la.head_merged, lp.proj_w, la.proj_out, B * T, C, C, false, false, 1.0f, 0.0f, stream);
-        add_bias(la.proj_out, lp.proj_b, B * T, C, stream);
-
-        // Residual Connection 1: res1 = curr_x + proj_out
-        residual_add(curr_x, la.proj_out, la.res1_out, B * T * C, stream);
+        add_bias_residual(curr_x, la.proj_out, lp.proj_b, la.res1_out, B * T, C, stream);
+        NVTX_POP();
 
         // Pre-LN 2
+        NVTX_PUSH("LN2");
         layernorm_forward(
             la.res1_out, lp.ln2_gamma, lp.ln2_beta,
             la.ln2_out, la.ln2_mean, la.ln2_rstd,
             B * T, C, config.layernorm_eps, stream
         );
+        NVTX_POP();
 
-        // FFN Layer 1: (B * T, C) x (C, d_ff) -> (B * T, d_ff)
+        // FFN Layer 1 & Fused Bias-GELU
+        NVTX_PUSH("FFN1_GELU");
         matmul_forward(cublas_handle, la.ln2_out, lp.ffn1_w, la.ffn1_out, B * T, d_ff, C, false, false, 1.0f, 0.0f, stream);
-        add_bias(la.ffn1_out, lp.ffn1_b, B * T, d_ff, stream);
+        add_bias_gelu_forward(la.ffn1_out, lp.ffn1_b, la.ffn_gelu, B * T, d_ff, stream);
+        NVTX_POP();
 
-        // GELU Activation
-        gelu_forward(la.ffn1_out, la.ffn_gelu, B * T * d_ff, stream);
-
-        // FFN Layer 2: (B * T, d_ff) x (d_ff, C) -> (B * T, C)
+        // FFN Layer 2 & Fused Residual Add
+        NVTX_PUSH("FFN2_Residual");
         matmul_forward(cublas_handle, la.ffn_gelu, lp.ffn2_w, la.ffn2_out, B * T, C, d_ff, false, false, 1.0f, 0.0f, stream);
-        add_bias(la.ffn2_out, lp.ffn2_b, B * T, C, stream);
-
-        // Residual Connection 2: block_out = res1_out + ffn2_out
-        residual_add(la.res1_out, la.ffn2_out, la.block_out, B * T * C, stream);
+        add_bias_residual(la.res1_out, la.ffn2_out, lp.ffn2_b, la.block_out, B * T, C, stream);
+        NVTX_POP();
 
         curr_x = la.block_out;
+        NVTX_POP(); // Layer_Fwd
     }
 
     // 3. Final LayerNorm
+    NVTX_PUSH("LN_Final");
     layernorm_forward(
         curr_x, params.ln_f_gamma, params.ln_f_beta,
         acts.ln_f_out, acts.ln_f_mean, acts.ln_f_rstd,
         B * T, C, config.layernorm_eps, stream
     );
+    NVTX_POP();
 
     // 4. Head Projection to Logits: (B * T, C) x (C, V) -> (B * T, V)
+    NVTX_PUSH("Head_Proj");
     matmul_forward(cublas_handle, acts.ln_f_out, params.head_w, acts.logits, B * T, V, C, false, false, 1.0f, 0.0f, stream);
+    NVTX_POP();
+
+    NVTX_POP(); // Transformer_Forward
 }
 
 void TransformerModel::backward(const int* d_tokens, const int* d_targets, float* host_loss, cudaStream_t stream) {
+    NVTX_PUSH("Transformer_Backward");
     int B = static_cast<int>(config.batch_size);
     int T = static_cast<int>(config.max_seq_len);
     int C = static_cast<int>(config.d_model);
@@ -343,14 +364,11 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
     int L = static_cast<int>(config.num_layers);
 
     // 1. Fused Cross-Entropy Loss & d_logits
+    NVTX_PUSH("Loss_Head_Bwd");
     cross_entropy_forward_backward(acts.logits, d_targets, grads.d_logits, host_loss, B, T, V, stream);
 
     // 2. Head Projection Backward:
-    // head_w: (C, V), acts.ln_f_out: (B * T, C), grads.d_logits: (B * T, V)
-    // d_head_w = ln_f_out^T x d_logits: (C, B * T) x (B * T, V) -> (C, V)
     matmul_forward(cublas_handle, acts.ln_f_out, grads.d_logits, grads.params.head_w, C, V, B * T, true, false, 1.0f, 0.0f, stream);
-
-    // d_ln_f_out = d_logits x head_w^T: (B * T, V) x (V, C) -> (B * T, C)
     matmul_forward(cublas_handle, grads.d_logits, params.head_w, grads.d_ln_f_out, B * T, C, V, false, true, 1.0f, 0.0f, stream);
 
     // 3. Final LayerNorm Backward
@@ -361,70 +379,65 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
         grads.d_block_out, grads.params.ln_f_gamma, grads.params.ln_f_beta,
         B * T, C, stream
     );
+    NVTX_POP();
 
     float scale = 1.0f / sqrtf(static_cast<float>(d_head));
 
     // 4. Reverse Block Iteration
     for (int l = L - 1; l >= 0; --l) {
+        NVTX_PUSH("Layer_Bwd");
         LayerParameters& lp = params.layers[l];
         LayerParameters& d_lp = grads.params.layers[l];
         LayerActivations& la = acts.layers[l];
         const float* block_input = (l > 0) ? acts.layers[l - 1].block_out : acts.emb_out;
 
         // Residual 2: d_block_out branches into d_res1_out and d_ffn2_out
-        // d_res1_out = d_block_out, d_ffn2_out = d_block_out
         CUDA_CHECK(cudaMemcpyAsync(grads.d_res1_out, grads.d_block_out, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(grads.d_ffn2_out, grads.d_block_out, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 
-        // FFN2 Backward: ffn2_w: (d_ff, C), ffn2_b: (C,)
-        // d_ffn2_w = ffn_gelu^T x d_ffn2_out: (d_ff, B * T) x (B * T, C) -> (d_ff, C)
+        // FFN2 Backward
+        NVTX_PUSH("FFN2_Bwd");
         matmul_forward(cublas_handle, la.ffn_gelu, grads.d_ffn2_out, d_lp.ffn2_w, d_ff, C, B * T, true, false, 1.0f, 0.0f, stream);
         bias_backward(grads.d_ffn2_out, d_lp.ffn2_b, B * T, C, stream);
-
-        // d_ffn_gelu = d_ffn2_out x ffn2_w^T: (B * T, C) x (C, d_ff) -> (B * T, d_ff)
         matmul_forward(cublas_handle, grads.d_ffn2_out, lp.ffn2_w, grads.d_ffn_gelu, B * T, d_ff, C, false, true, 1.0f, 0.0f, stream);
+        NVTX_POP();
 
         // GELU Backward
+        NVTX_PUSH("GELU_Bwd");
         gelu_backward(grads.d_ffn_gelu, la.ffn1_out, grads.d_ffn1_out, B * T * d_ff, stream);
+        NVTX_POP();
 
-        // FFN1 Backward: ffn1_w: (C, d_ff), ffn1_b: (d_ff,)
-        // d_ffn1_w = ln2_out^T x d_ffn1_out: (C, B * T) x (B * T, d_ff) -> (C, d_ff)
+        // FFN1 Backward
+        NVTX_PUSH("FFN1_Bwd");
         matmul_forward(cublas_handle, la.ln2_out, grads.d_ffn1_out, d_lp.ffn1_w, C, d_ff, B * T, true, false, 1.0f, 0.0f, stream);
         bias_backward(grads.d_ffn1_out, d_lp.ffn1_b, B * T, d_ff, stream);
-
-        // d_ln2_out = d_ffn1_out x ffn1_w^T: (B * T, d_ff) x (d_ff, C) -> (B * T, C)
         matmul_forward(cublas_handle, grads.d_ffn1_out, lp.ffn1_w, grads.d_ln2_out, B * T, C, d_ff, false, true, 1.0f, 0.0f, stream);
+        NVTX_POP();
 
         // LayerNorm 2 Backward
-        // Writes gradient w.r.t input of LN2 into grads.d_emb_out (temporary buffer)
+        NVTX_PUSH("LN2_Bwd");
         layernorm_backward(
             grads.d_ln2_out, la.res1_out, lp.ln2_gamma,
             la.ln2_mean, la.ln2_rstd,
             grads.d_emb_out, d_lp.ln2_gamma, d_lp.ln2_beta,
             B * T, C, stream
         );
-
-        // Accumulate into d_res1_out: d_res1_out += d_ln2_in
         residual_accumulate(grads.d_res1_out, grads.d_emb_out, B * T * C, stream);
+        NVTX_POP();
 
         // Residual 1: d_res1_out branches into d_in and d_proj_out
-        // d_proj_out = d_res1_out; d_in will be accumulated later
         CUDA_CHECK(cudaMemcpyAsync(grads.d_proj_out, grads.d_res1_out, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 
-        // Proj Backward: proj_w: (C, C), proj_b: (C,)
-        // d_proj_w = head_merged^T x d_proj_out: (C, B * T) x (B * T, C) -> (C, C)
+        // Proj Backward
+        NVTX_PUSH("Attn_Out_Bwd");
         matmul_forward(cublas_handle, la.head_merged, grads.d_proj_out, d_lp.proj_w, C, C, B * T, true, false, 1.0f, 0.0f, stream);
         bias_backward(grads.d_proj_out, d_lp.proj_b, B * T, C, stream);
-
-        // d_head_merged = d_proj_out x proj_w^T: (B * T, C) x (C, C) -> (B * T, C)
         matmul_forward(cublas_handle, grads.d_proj_out, lp.proj_w, grads.d_head_merged, B * T, C, C, false, true, 1.0f, 0.0f, stream);
-
-        // Head Merge Backward: (B, T, C) -> (B, H, T, d_head)
         head_merge_transpose_backward(grads.d_head_merged, grads.d_attn_out, B, H, T, d_head, stream);
+        NVTX_POP();
 
-        // Attention-Value Batched GEMM Backward:
-        // Out = Probs x V
-        // d_probs = d_attn_out x V^T: (B * H, T, d_head) x (B * H, d_head, T) -> (B * H, T, T)
+        // Attention GEMMs Backward
+        NVTX_PUSH("Attention_Bwd");
         matmul_batched_strided(
             cublas_handle,
             grads.d_attn_out, la.v, grads.d_attn_probs,
@@ -433,7 +446,6 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
             B * H, false, true, 1.0f, 0.0f, stream
         );
 
-        // d_v = Probs^T x d_attn_out: (B * H, T, T) x (B * H, T, d_head) -> (B * H, T, d_head)
         matmul_batched_strided(
             cublas_handle,
             la.attn_probs, grads.d_attn_out, grads.d_v,
@@ -442,12 +454,8 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
             B * H, true, false, 1.0f, 0.0f, stream
         );
 
-        // Softmax Backward: d_probs -> d_attn_scores
         causal_softmax_backward(grads.d_attn_probs, la.attn_probs, grads.d_attn_scores, B, H, T, scale, stream);
 
-        // Attention Scores Batched GEMM Backward:
-        // Scores = Q x K^T
-        // d_q = d_scores x K: (B * H, T, T) x (B * H, T, d_head) -> (B * H, T, d_head)
         matmul_batched_strided(
             cublas_handle,
             grads.d_attn_scores, la.k, grads.d_q,
@@ -456,7 +464,6 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
             B * H, false, false, 1.0f, 0.0f, stream
         );
 
-        // d_k = d_scores^T x Q: (B * H, T, T) x (B * H, T, d_head) -> (B * H, T, d_head)
         matmul_batched_strided(
             cublas_handle,
             grads.d_attn_scores, la.q, grads.d_k,
@@ -465,32 +472,36 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
             B * H, true, false, 1.0f, 0.0f, stream
         );
 
-        // QKV Split Transpose Backward: d_q, d_k, d_v -> d_qkv
         qkv_split_transpose_backward(grads.d_q, grads.d_k, grads.d_v, grads.d_qkv, B, T, H, d_head, stream);
+        NVTX_POP();
 
-        // QKV Projection Backward: qkv_w: (C, 3 * C), qkv_b: (3 * C,)
-        // d_qkv_w = ln1_out^T x d_qkv: (C, B * T) x (B * T, 3 * C) -> (C, 3 * C)
+        // QKV Projection Backward
+        NVTX_PUSH("QKV_Proj_Bwd");
         matmul_forward(cublas_handle, la.ln1_out, grads.d_qkv, d_lp.qkv_w, C, 3 * C, B * T, true, false, 1.0f, 0.0f, stream);
         bias_backward(grads.d_qkv, d_lp.qkv_b, B * T, 3 * C, stream);
-
-        // d_ln1_out = d_qkv x qkv_w^T: (B * T, 3 * C) x (3 * C, C) -> (B * T, C)
         matmul_forward(cublas_handle, grads.d_qkv, lp.qkv_w, grads.d_ln1_out, B * T, C, 3 * C, false, true, 1.0f, 0.0f, stream);
+        NVTX_POP();
 
-        // LayerNorm 1 Backward:
-        // Writes gradient w.r.t input of LN1 into grads.d_emb_out (temporary buffer)
+        // LayerNorm 1 Backward
+        NVTX_PUSH("LN1_Bwd");
         layernorm_backward(
             grads.d_ln1_out, block_input, lp.ln1_gamma,
             la.ln1_mean, la.ln1_rstd,
             grads.d_emb_out, d_lp.ln1_gamma, d_lp.ln1_beta,
             B * T, C, stream
         );
-
-        // Final gradient for this block's input: d_block_in = d_res1_out + d_ln1_in
         residual_add(grads.d_res1_out, grads.d_emb_out, grads.d_block_out, B * T * C, stream);
+        NVTX_POP();
+
+        NVTX_POP(); // Layer_Bwd
     }
 
     // 5. Embedding Backward: accum into d_tok_emb, d_pos_emb
+    NVTX_PUSH("Embedding_Bwd");
     embedding_backward(grads.d_block_out, d_tokens, grads.params.token_emb, grads.params.pos_emb, B, T, C, stream);
+    NVTX_POP();
+
+    NVTX_POP(); // Transformer_Backward
 }
 
 void TransformerModel::save_parameters(const std::string& filename) const {

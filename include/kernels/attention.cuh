@@ -30,6 +30,21 @@ void causal_softmax_forward(
     cudaStream_t stream = 0
 );
 
+// FlashAttention-Style Tiled Causal Multi-Head Attention Forward:
+// Computes Out = Softmax(scale * (Q * K^T) + Mask) * V
+// Completely eliminates the O(T^2) intermediate attention score/prob matrices in DRAM
+// using shared memory tiling and register-level online softmax.
+// Shapes: Q, K, V, Out: (B, H, T, d_head)
+void tiled_causal_attention_forward(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    int B, int H, int T, int d_head,
+    float scale,
+    cudaStream_t stream = 0
+);
+
 // Fused Scaled Causal Softmax Backward:
 // dscores = scale * probs * (dprobs - sum(dprobs * probs)) for j <= i, else 0
 void causal_softmax_backward(

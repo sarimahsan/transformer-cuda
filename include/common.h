@@ -77,3 +77,22 @@ struct CpuTimer {
         return std::chrono::duration<float, std::milli>(t_stop - t_start).count();
     }
 };
+
+// NVTX Profiling Support for Nsight Systems
+#if !defined(DISABLE_NVTX)
+#include <nvtx3/nvToolsExt.h>
+#define NVTX_PUSH(name) nvtxRangePushA(name)
+#define NVTX_POP() nvtxRangePop()
+#else
+#define NVTX_PUSH(name) ((void)0)
+#define NVTX_POP() ((void)0)
+#endif
+
+struct NvtxScopedRange {
+    explicit NvtxScopedRange(const char* name) {
+        NVTX_PUSH(name);
+    }
+    ~NvtxScopedRange() {
+        NVTX_POP();
+    }
+};

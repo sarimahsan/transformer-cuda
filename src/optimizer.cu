@@ -120,6 +120,7 @@ void AdamW::zero_grad(cudaStream_t stream) {
 }
 
 float AdamW::clip_grad_norm(float max_norm, cudaStream_t stream) {
+    NVTX_PUSH("Clip_Grad_Norm");
     int block_dim = 256;
     int grid_dim = (num_params + block_dim - 1) / block_dim;
     size_t shared_size = (block_dim / WARP_SIZE) * sizeof(float);
@@ -138,10 +139,12 @@ float AdamW::clip_grad_norm(float max_norm, cudaStream_t stream) {
         float scale = max_norm / norm;
         scale_grads_kernel<<<grid_dim, block_dim, 0, stream>>>(d_grads, scale, num_params);
     }
+    NVTX_POP();
     return norm;
 }
 
 void AdamW::step(float lr, cudaStream_t stream) {
+    NVTX_PUSH("AdamW_Step");
     step_count++;
     float bias_correction1 = 1.0f - powf(beta1, (float)step_count);
     float bias_correction2 = 1.0f - powf(beta2, (float)step_count);
@@ -154,4 +157,5 @@ void AdamW::step(float lr, cudaStream_t stream) {
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2
     );
+    NVTX_POP();
 }

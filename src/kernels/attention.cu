@@ -315,3 +315,129 @@ void head_merge_transpose_backward(
         dout, din, B, H, T, d_head
     );
 }
+
+// FlashAttention-Style Tiled Causal Attention Forward Kernel
+// Br: Query tile size (blockDim.x), Bc: Key/Value tile size (shared memory)
+template <int Bc>
+__global__ void tiled_causal_attention_fwd_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    int B, int H, int T, int d_head,
+    float scale,
+    int Br
+) {
+    int bh = blockIdx.y; // batch and head index: [0, B * H - 1]
+    int query_tile_idx = blockIdx.x;
+    int i = query_tile_idx * Br + threadIdx.x; // query sequence position
+
+    int head_stride = T * d_head;
+    const float* q_head = q + bh * head_stride;
+    const float* k_head = k + bh * head_stride;
+    const float* v_head = v + bh * head_stride;
+    float* out_head = out + bh * head_stride;
+
+    extern __shared__ float smem[];
+    float* s_k = smem;                // size: Bc * d_head
+    float* s_v = smem + Bc * d_head;  // size: Bc * d_head
+
+    // Thread-local registers
+    float q_reg[128];
+    float o_reg[128];
+    float m_i = -FLT_MAX;
+    float l_i = 0.0f;
+
+    if (i < T) {
+        #pragma unroll 4
+        for (int d = 0; d < d_head; ++d) {
+            q_reg[d] = q_head[i * d_head + d];
+            o_reg[d] = 0.0f;
+        }
+    }
+
+    int max_query_in_tile = min(T - 1, (query_tile_idx + 1) * Br - 1);
+    int num_kv_tiles = (T + Bc - 1) / Bc;
+
+    for (int c = 0; c < num_kv_tiles; ++c) {
+        // Causal skip: if this entire KV tile starts after the maximum query in this block
+        if (c * Bc > max_query_in_tile) break;
+
+        // Cooperatively load K and V tile into Shared Memory
+        int total_kv_elements = Bc * d_head;
+        for (int idx = threadIdx.x; idx < total_kv_elements; idx += blockDim.x) {
+            int k_t = idx / d_head;
+            int k_d = idx % d_head;
+            int global_k_pos = c * Bc + k_t;
+            if (global_k_pos < T) {
+                s_k[idx] = k_head[global_k_pos * d_head + k_d];
+                s_v[idx] = v_head[global_k_pos * d_head + k_d];
+            } else {
+                s_k[idx] = 0.0f;
+                s_v[idx] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // Compute dot-product attention and online softmax in registers
+        if (i < T) {
+            int max_j = min(i, (c + 1) * Bc - 1);
+            int start_j = c * Bc;
+
+            for (int j = start_j; j <= max_j; ++j) {
+                int j_rel = j - start_j;
+                const float* k_vec = s_k + j_rel * d_head;
+                const float* v_vec = s_v + j_rel * d_head;
+
+                float score = 0.0f;
+                #pragma unroll 4
+                for (int d = 0; d < d_head; ++d) {
+                    score += q_reg[d] * k_vec[d];
+                }
+                score *= scale;
+
+                // Online Softmax update
+                float m_new = fmaxf(m_i, score);
+                float alpha = expf(m_i - m_new);
+                float beta = expf(score - m_new);
+                l_i = l_i * alpha + beta;
+
+                #pragma unroll 4
+                for (int d = 0; d < d_head; ++d) {
+                    o_reg[d] = o_reg[d] * alpha + beta * v_vec[d];
+                }
+                m_i = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write final normalized outputs to global memory
+    if (i < T) {
+        float inv_l = (l_i > 0.0f) ? (1.0f / (l_i + 1e-12f)) : 0.0f;
+        #pragma unroll 4
+        for (int d = 0; d < d_head; ++d) {
+            out_head[i * d_head + d] = o_reg[d] * inv_l;
+        }
+    }
+}
+
+void tiled_causal_attention_forward(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    int B, int H, int T, int d_head,
+    float scale,
+    cudaStream_t stream
+) {
+    const int Br = 64; // Query tile size
+    const int Bc = 32; // Key/Value tile size
+    dim3 grid((T + Br - 1) / Br, B * H);
+    dim3 block(Br);
+
+    size_t shared_mem_bytes = 2 * Bc * d_head * sizeof(float);
+    tiled_causal_attention_fwd_kernel<Bc><<<grid, block, shared_mem_bytes, stream>>>(
+        q, k, v, out, B, H, T, d_head, scale, Br
+    );
+}

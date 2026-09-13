@@ -82,6 +82,8 @@ int main(int argc, char** argv) {
             warmup_steps = std::stoi(argv[++i]);
         } else if (arg == "--steps" && i + 1 < argc) {
             bench_steps = std::stoi(argv[++i]);
+        } else if (arg == "--tiled_attn") {
+            config.use_tiled_attention = true;
         } else if (arg == "--json") {
             json_output = true;
         } else if (arg == "--help") {
