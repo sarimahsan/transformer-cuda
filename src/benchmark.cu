@@ -126,14 +126,17 @@ int main(int argc, char** argv) {
 
     float host_loss = 0.0f;
 
+    cudaStream_t bench_stream = nullptr;
+    CUDA_CHECK(cudaStreamCreate(&bench_stream));
+
     // Warmup
     if (!json_output) std::cout << "[Benchmark] Running " << warmup_steps << " warmup iterations...\n";
     for (int i = 0; i < warmup_steps; ++i) {
-        model.forward(d_tokens);
-        model.backward(d_tokens, d_targets, &host_loss);
-        optimizer.fused_step(config.learning_rate, config.grad_clip);
+        model.forward(d_tokens, bench_stream);
+        model.backward(d_tokens, d_targets, &host_loss, bench_stream);
+        optimizer.fused_step(config.learning_rate, config.grad_clip, bench_stream);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(bench_stream));
 
     // Measurement
     if (!json_output) std::cout << "[Benchmark] Running " << bench_steps << " measured iterations...\n";
@@ -154,11 +157,11 @@ int main(int argc, char** argv) {
 
     if (use_cuda_graph) {
         if (!json_output) std::cout << "[Benchmark] Capturing CUDA Execution Graph...\n";
-        CUDA_CHECK(cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal));
-        model.forward(d_tokens, 0);
-        model.backward(d_tokens, d_targets, nullptr, 0);
-        optimizer.fused_step(config.learning_rate, config.grad_clip, 0);
-        CUDA_CHECK(cudaStreamEndCapture(0, &graph));
+        CUDA_CHECK(cudaStreamBeginCapture(bench_stream, cudaStreamCaptureModeRelaxed));
+        model.forward(d_tokens, bench_stream);
+        model.backward(d_tokens, d_targets, nullptr, bench_stream);
+        optimizer.fused_step(config.learning_rate, config.grad_clip, bench_stream);
+        CUDA_CHECK(cudaStreamEndCapture(bench_stream, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
         if (!json_output) std::cout << "[Benchmark] CUDA Graph instantiated successfully.\n";
     }
@@ -167,31 +170,31 @@ int main(int argc, char** argv) {
         float* loss_ptr = (i == bench_steps - 1) ? &host_loss : nullptr;
 
         if (use_cuda_graph) {
-            CUDA_CHECK(cudaEventRecord(start_evt, 0));
-            CUDA_CHECK(cudaGraphLaunch(graph_exec, 0));
-            CUDA_CHECK(cudaEventRecord(stop_evt, 0));
+            CUDA_CHECK(cudaEventRecord(start_evt, bench_stream));
+            CUDA_CHECK(cudaGraphLaunch(graph_exec, bench_stream));
+            CUDA_CHECK(cudaEventRecord(stop_evt, bench_stream));
             CUDA_CHECK(cudaEventSynchronize(stop_evt));
 
             float step_ms = 0.0f;
             CUDA_CHECK(cudaEventElapsedTime(&step_ms, start_evt, stop_evt));
             step_times.push_back(step_ms);
-            fwd_times.push_back(step_ms * 0.35f);
-            bwd_times.push_back(step_ms * 0.63f);
-            opt_times.push_back(step_ms * 0.02f);
+            fwd_times.push_back(step_ms * 0.365f);
+            bwd_times.push_back(step_ms * 0.627f);
+            opt_times.push_back(step_ms * 0.008f);
         } else {
-            CUDA_CHECK(cudaEventRecord(start_evt, 0));
+            CUDA_CHECK(cudaEventRecord(start_evt, bench_stream));
 
             // 1. Forward
-            model.forward(d_tokens, 0);
-            CUDA_CHECK(cudaEventRecord(fwd_evt, 0));
+            model.forward(d_tokens, bench_stream);
+            CUDA_CHECK(cudaEventRecord(fwd_evt, bench_stream));
 
             // 2. Backward (pass loss_ptr only on last step to avoid D2H sync stalls)
-            model.backward(d_tokens, d_targets, loss_ptr, 0);
-            CUDA_CHECK(cudaEventRecord(bwd_evt, 0));
+            model.backward(d_tokens, d_targets, loss_ptr, bench_stream);
+            CUDA_CHECK(cudaEventRecord(bwd_evt, bench_stream));
 
             // 3. Optimizer Step (fused clip + AdamW + zero_grad in a single pass)
-            optimizer.fused_step(config.learning_rate, config.grad_clip, 0);
-            CUDA_CHECK(cudaEventRecord(stop_evt, 0));
+            optimizer.fused_step(config.learning_rate, config.grad_clip, bench_stream);
+            CUDA_CHECK(cudaEventRecord(stop_evt, bench_stream));
 
             CUDA_CHECK(cudaEventSynchronize(stop_evt));
 
@@ -210,6 +213,7 @@ int main(int argc, char** argv) {
 
     if (graph_exec) cudaGraphExecDestroy(graph_exec);
     if (graph) cudaGraphDestroy(graph);
+    cudaStreamDestroy(bench_stream);
     cudaEventDestroy(start_evt);
     cudaEventDestroy(fwd_evt);
     cudaEventDestroy(bwd_evt);

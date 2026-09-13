@@ -247,7 +247,11 @@ void TransformerModel::init_parameters(unsigned long long seed) {
 
 void TransformerModel::forward(const int* d_tokens, cudaStream_t stream) {
     NVTX_PUSH("Transformer_Forward");
-    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+    cudaStream_t cur_stream = nullptr;
+    cublasGetStream(cublas_handle, &cur_stream);
+    if (cur_stream != stream) {
+        CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+    }
     int B = static_cast<int>(config.batch_size);
     int T = static_cast<int>(config.max_seq_len);
     int C = static_cast<int>(config.d_model);
@@ -426,7 +430,11 @@ void TransformerModel::forward(const int* d_tokens, cudaStream_t stream) {
 
 void TransformerModel::backward(const int* d_tokens, const int* d_targets, float* host_loss, cudaStream_t stream) {
     NVTX_PUSH("Transformer_Backward");
-    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+    cudaStream_t cur_stream = nullptr;
+    cublasGetStream(cublas_handle, &cur_stream);
+    if (cur_stream != stream) {
+        CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+    }
     int B = static_cast<int>(config.batch_size);
     int T = static_cast<int>(config.max_seq_len);
     int C = static_cast<int>(config.d_model);
