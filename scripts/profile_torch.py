@@ -85,7 +85,6 @@ def profile_model(
             torch.profiler.ProfilerActivity.CUDA,
         ],
         schedule=torch.profiler.schedule(wait=1, warmup=warmup_steps, active=active_steps, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(out_dir),
         record_shapes=True,
         profile_memory=True,
         with_stack=False
@@ -103,9 +102,12 @@ def profile_model(
             prof.step()
 
     # Export Chrome trace
-    prof.export_chrome_trace(trace_file)
-    print(f"\n[Success] Chrome trace exported to: {trace_file}")
-    print(f"          (Open in browser at: chrome://tracing or https://ui.perfetto.dev)\n")
+    try:
+        prof.export_chrome_trace(trace_file)
+        print(f"\n[Success] Chrome trace exported to: {trace_file}")
+        print(f"          (Open in browser at: chrome://tracing or https://ui.perfetto.dev)\n")
+    except Exception as e:
+        print(f"\n[Notice] Trace export note: {e}\n")
 
     # Display Top CUDA kernels by total CUDA time
     print("=" * 100)
