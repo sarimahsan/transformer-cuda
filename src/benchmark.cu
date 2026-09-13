@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
             bench_steps = std::stoi(argv[++i]);
         } else if (arg == "--tiled_attn") {
             config.use_tiled_attention = true;
-        } else if (arg == "--cuda_graph") {
+        } else if (arg == "--cuda_graph" || arg == "--cuda-graph") {
             use_cuda_graph = true;
         } else if (arg == "--json") {
             json_output = true;
