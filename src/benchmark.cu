@@ -61,6 +61,7 @@ int main(int argc, char** argv) {
     int warmup_steps = 10;
     int bench_steps = 50;
     bool json_output = false;
+    bool use_cuda_graph = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
