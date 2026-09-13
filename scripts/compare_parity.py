@@ -40,10 +40,15 @@ def run_parity_audit(
     num_layers: int = 2,
     num_heads: int = 4,
     vocab_size: int = 65,
-    seed: int = 42
+    seed: int = 42,
+    tiled_attn: bool = False
 ):
     print("=" * 80)
     print(" Numerical Parity Gate: Pure CUDA vs. PyTorch Golden Autograd Reference")
+    if tiled_attn:
+        print(" Mode: FlashAttention-Style Tiled Attention (Online Recomputation)")
+    else:
+        print(" Mode: Standard Materialized Causal Softmax Attention")
     print("=" * 80)
 
     # 1. Generate PyTorch golden references
@@ -72,6 +77,9 @@ def run_parity_audit(
         return False
 
     cmd = [cuda_bin_path, data_dir]
+    if tiled_attn:
+        cmd.append("--tiled_attn")
+
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
         print(res.stdout)
@@ -117,4 +125,29 @@ def run_parity_audit(
 
 
 if __name__ == "__main__":
-    run_parity_audit()
+    import argparse
+    parser = argparse.ArgumentParser(description="Audit numerical parity between Pure CUDA and PyTorch")
+    parser.add_argument("--data_dir", type=str, default="tests/parity_data")
+    parser.add_argument("--cuda_binary", type=str, default="bin/parity_audit")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--seq_len", type=int, default=16)
+    parser.add_argument("--d_model", type=int, default=64)
+    parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--vocab_size", type=int, default=65)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tiled_attn", action="store_true", help="Audit with tiled attention kernel")
+    args = parser.parse_args()
+
+    run_parity_audit(
+        data_dir=args.data_dir,
+        cuda_binary=args.cuda_binary,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        d_model=args.d_model,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        vocab_size=args.vocab_size,
+        seed=args.seed,
+        tiled_attn=args.tiled_attn
+    )

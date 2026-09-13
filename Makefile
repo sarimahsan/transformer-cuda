@@ -11,7 +11,7 @@ ARCH_FLAGS ?= -gencode arch=compute_60,code=sm_60 \
               -gencode arch=compute_89,code=sm_89
 
 NVCC_FLAGS = -O3 -std=c++17 -Iinclude $(ARCH_FLAGS) --use_fast_math -Wno-deprecated-gpu-targets -Xcompiler -Wall,-Wextra,-fopenmp
-LDFLAGS = -lcublas -lcudart -lm
+LDFLAGS = -lcublas -lcublasLt -lcudart -lm
 
 BUILD_DIR = build
 BIN_DIR = bin

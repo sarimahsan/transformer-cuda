@@ -35,6 +35,105 @@ void matmul_forward(
     ));
 }
 
+void matmul_cublaslt(
+    cublasLtHandle_t lt_handle,
+    const float* A,
+    const float* B,
+    float* C,
+    int M, int N, int K,
+    cublasLtEpilogue_t epilogue,
+    const float* bias,
+    void* workspace,
+    size_t workspace_size,
+    bool transA,
+    bool transB,
+    float alpha,
+    float beta,
+    cudaStream_t stream
+) {
+    cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    int lda = transA ? M : K;
+    int ldb = transB ? K : N;
+    int ldc = N;
+
+    cublasLtMatmulDesc_t operationDesc = NULL;
+    cublasLtMatrixLayout_t layoutB = NULL;
+    cublasLtMatrixLayout_t layoutA = NULL;
+    cublasLtMatrixLayout_t layoutC = NULL;
+
+    cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opB, sizeof(opB));
+    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opA, sizeof(opA));
+
+    if (epilogue != CUBLASLT_EPILOGUE_DEFAULT) {
+        cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue));
+        if (bias != nullptr) {
+            cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias));
+        }
+    }
+
+    int rowsB = transB ? K : N;
+    int colsB = transB ? N : K;
+    cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_32F, rowsB, colsB, ldb);
+
+    int rowsA = transA ? M : K;
+    int colsA = transA ? K : M;
+    cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_32F, rowsA, colsA, lda);
+
+    cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_32F, N, M, ldc);
+
+    cublasLtMatmulPreference_t preference = NULL;
+    cublasLtMatmulPreferenceCreate(&preference);
+    if (workspace != nullptr && workspace_size > 0) {
+        cublasLtMatmulPreferenceSetAttribute(
+            preference,
+            CUBLASLT_MATMUL_PREFERENCE_WORKSPACE_SIZE,
+            &workspace_size,
+            sizeof(workspace_size)
+        );
+    }
+
+    cublasLtMatmulHeuristicResult_t heuristicResult = {};
+    int returnedResults = 0;
+    cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
+        lt_handle,
+        operationDesc,
+        layoutB,
+        layoutA,
+        layoutC,
+        layoutC,
+        preference,
+        1,
+        &heuristicResult,
+        &returnedResults
+    );
+
+    if (status == CUBLAS_STATUS_SUCCESS && returnedResults > 0) {
+        cublasLtMatmul(
+            lt_handle,
+            operationDesc,
+            &alpha,
+            B, layoutB,
+            A, layoutA,
+            &beta,
+            C, layoutC,
+            C, layoutC,
+            &heuristicResult.algo,
+            workspace,
+            workspace_size,
+            stream
+        );
+    }
+
+    if (preference) cublasLtMatmulPreferenceDestroy(preference);
+    if (layoutC) cublasLtMatrixLayoutDestroy(layoutC);
+    if (layoutA) cublasLtMatrixLayoutDestroy(layoutA);
+    if (layoutB) cublasLtMatrixLayoutDestroy(layoutB);
+    if (operationDesc) cublasLtMatmulDescDestroy(operationDesc);
+}
+
 void matmul_batched_strided(
     cublasHandle_t handle,
     const float* A,

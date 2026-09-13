@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_runtime.h>
 
 // Row-Major Matrix Multiplication using cuBLAS:
@@ -12,6 +13,25 @@ void matmul_forward(
     const float* B,
     float* C,
     int M, int N, int K,
+    bool transA = false,
+    bool transB = false,
+    float alpha = 1.0f,
+    float beta = 0.0f,
+    cudaStream_t stream = 0
+);
+
+// High-Performance cuBLASLt Matrix Multiplication with Fused Epilogues
+// Epilogues supported: CUBLASLT_EPILOGUE_DEFAULT, CUBLASLT_EPILOGUE_BIAS, CUBLASLT_EPILOGUE_GELU_BIAS
+void matmul_cublaslt(
+    cublasLtHandle_t lt_handle,
+    const float* A,
+    const float* B,
+    float* C,
+    int M, int N, int K,
+    cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT,
+    const float* bias = nullptr,
+    void* workspace = nullptr,
+    size_t workspace_size = 0,
     bool transA = false,
     bool transB = false,
     float alpha = 1.0f,

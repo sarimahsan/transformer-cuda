@@ -13,9 +13,11 @@
 #include <fstream>
 #include <algorithm>
 
-TransformerModel::TransformerModel(const TransformerConfig& cfg) : config(cfg) {
+TransformerModel::TransformerModel(const TransformerConfig& cfg)
+    : config(cfg), cublas_handle(nullptr), cublaslt_handle(nullptr), d_cublaslt_workspace(nullptr), cublaslt_workspace_size(0) {
     config.validate();
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
+    cublasLtCreate(&cublaslt_handle);
     allocate_memory();
     init_parameters(42);
 }
@@ -24,6 +26,9 @@ TransformerModel::~TransformerModel() {
     free_memory();
     if (cublas_handle != nullptr) {
         cublasDestroy(cublas_handle);
+    }
+    if (cublaslt_handle != nullptr) {
+        cublasLtDestroy(cublaslt_handle);
     }
 }
 
@@ -73,6 +78,8 @@ void TransformerModel::allocate_memory() {
         CUDA_CHECK(cudaMalloc(&acts.layers[l].attn_scores, B * H * T * T * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&acts.layers[l].attn_probs, B * H * T * T * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&acts.layers[l].attn_out, B * H * T * d_head * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&acts.layers[l].attn_m, B * H * T * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&acts.layers[l].attn_l, B * H * T * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&acts.layers[l].head_merged, B * T * C * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&acts.layers[l].proj_out, B * T * C * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&acts.layers[l].res1_out, B * T * C * sizeof(float)));
@@ -109,6 +116,11 @@ void TransformerModel::allocate_memory() {
     CUDA_CHECK(cudaMalloc(&grads.d_qkv, B * T * (3 * C) * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&grads.d_ln1_out, B * T * C * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&grads.d_emb_out, B * T * C * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&grads.d_attn_d_scratch, B * H * T * sizeof(float)));
+
+    // 4. cuBLASLt Workspace
+    cublaslt_workspace_size = 4 * 1024 * 1024; // 4 MB
+    CUDA_CHECK(cudaMalloc(&d_cublaslt_workspace, cublaslt_workspace_size));
 }
 
 void TransformerModel::free_memory() {
@@ -127,6 +139,8 @@ void TransformerModel::free_memory() {
         cudaFree(acts.layers[l].attn_scores);
         cudaFree(acts.layers[l].attn_probs);
         cudaFree(acts.layers[l].attn_out);
+        cudaFree(acts.layers[l].attn_m);
+        cudaFree(acts.layers[l].attn_l);
         cudaFree(acts.layers[l].head_merged);
         cudaFree(acts.layers[l].proj_out);
         cudaFree(acts.layers[l].res1_out);
@@ -162,6 +176,8 @@ void TransformerModel::free_memory() {
     cudaFree(grads.d_qkv);
     cudaFree(grads.d_ln1_out);
     cudaFree(grads.d_emb_out);
+    cudaFree(grads.d_attn_d_scratch);
+    cudaFree(d_cublaslt_workspace);
 }
 
 void TransformerModel::map_parameter_pointers(TransformerParameters& p, float* base) {
@@ -262,10 +278,21 @@ void TransformerModel::forward(const int* d_tokens, cudaStream_t stream) {
         );
         NVTX_POP();
 
-        // QKV Projection: (B * T, C) x (C, 3 * C) -> (B * T, 3 * C)
+        // QKV Projection: (B * T, C) x (C, 3 * C) -> (B * T, 3 * C) with cuBLASLt Fused Bias
         NVTX_PUSH("QKV_Proj");
-        matmul_forward(cublas_handle, la.ln1_out, lp.qkv_w, la.qkv, B * T, 3 * C, C, false, false, 1.0f, 0.0f, stream);
-        add_bias(la.qkv, lp.qkv_b, B * T, 3 * C, stream);
+        if (cublaslt_handle != nullptr) {
+            matmul_cublaslt(
+                cublaslt_handle,
+                la.ln1_out, lp.qkv_w, la.qkv,
+                B * T, 3 * C, C,
+                CUBLASLT_EPILOGUE_BIAS, lp.qkv_b,
+                d_cublaslt_workspace, cublaslt_workspace_size,
+                false, false, 1.0f, 0.0f, stream
+            );
+        } else {
+            matmul_forward(cublas_handle, la.ln1_out, lp.qkv_w, la.qkv, B * T, 3 * C, C, false, false, 1.0f, 0.0f, stream);
+            add_bias(la.qkv, lp.qkv_b, B * T, 3 * C, stream);
+        }
         NVTX_POP();
 
         // Split & Transpose QKV
@@ -275,8 +302,8 @@ void TransformerModel::forward(const int* d_tokens, cudaStream_t stream) {
         float scale = 1.0f / sqrtf(static_cast<float>(d_head));
 
         if (config.use_tiled_attention) {
-            // FlashAttention-Style Tiled Online Softmax in SRAM/registers
-            tiled_causal_attention_forward(la.q, la.k, la.v, la.attn_out, B, H, T, d_head, scale, stream);
+            // FlashAttention-Style Tiled Online Softmax in SRAM/registers with stats export
+            tiled_causal_attention_forward(la.q, la.k, la.v, la.attn_out, B, H, T, d_head, scale, la.attn_m, la.attn_l, stream);
         } else {
             // Batched GEMM: Attention Scores = Q x K^T
             matmul_batched_strided(
@@ -433,41 +460,53 @@ void TransformerModel::backward(const int* d_tokens, const int* d_targets, float
         head_merge_transpose_backward(grads.d_head_merged, grads.d_attn_out, B, H, T, d_head, stream);
         NVTX_POP();
 
-        // Attention GEMMs Backward
+        // Attention Backward
         NVTX_PUSH("Attention_Bwd");
-        matmul_batched_strided(
-            cublas_handle,
-            grads.d_attn_out, la.v, grads.d_attn_probs,
-            T, T, d_head,
-            T * d_head, T * d_head, T * T,
-            B * H, false, true, 1.0f, 0.0f, stream
-        );
+        if (config.use_tiled_attention) {
+            // FlashAttention Tiled Backward: bypasses all 4 GEMMs and Softmax Backward in DRAM
+            tiled_causal_attention_backward(
+                la.q, la.k, la.v, la.attn_out, grads.d_attn_out,
+                la.attn_m, la.attn_l,
+                grads.d_q, grads.d_k, grads.d_v,
+                grads.d_attn_d_scratch,
+                B, H, T, d_head, scale, stream
+            );
+        } else {
+            // Batched GEMM fallback
+            matmul_batched_strided(
+                cublas_handle,
+                grads.d_attn_out, la.v, grads.d_attn_probs,
+                T, T, d_head,
+                T * d_head, T * d_head, T * T,
+                B * H, false, true, 1.0f, 0.0f, stream
+            );
 
-        matmul_batched_strided(
-            cublas_handle,
-            la.attn_probs, grads.d_attn_out, grads.d_v,
-            T, d_head, T,
-            T * T, T * d_head, T * d_head,
-            B * H, true, false, 1.0f, 0.0f, stream
-        );
+            matmul_batched_strided(
+                cublas_handle,
+                la.attn_probs, grads.d_attn_out, grads.d_v,
+                T, d_head, T,
+                T * T, T * d_head, T * d_head,
+                B * H, true, false, 1.0f, 0.0f, stream
+            );
 
-        causal_softmax_backward(grads.d_attn_probs, la.attn_probs, grads.d_attn_scores, B, H, T, scale, stream);
+            causal_softmax_backward(grads.d_attn_probs, la.attn_probs, grads.d_attn_scores, B, H, T, scale, stream);
 
-        matmul_batched_strided(
-            cublas_handle,
-            grads.d_attn_scores, la.k, grads.d_q,
-            T, d_head, T,
-            T * T, T * d_head, T * d_head,
-            B * H, false, false, 1.0f, 0.0f, stream
-        );
+            matmul_batched_strided(
+                cublas_handle,
+                grads.d_attn_scores, la.k, grads.d_q,
+                T, d_head, T,
+                T * T, T * d_head, T * d_head,
+                B * H, false, false, 1.0f, 0.0f, stream
+            );
 
-        matmul_batched_strided(
-            cublas_handle,
-            grads.d_attn_scores, la.q, grads.d_k,
-            T, d_head, T,
-            T * T, T * d_head, T * d_head,
-            B * H, true, false, 1.0f, 0.0f, stream
-        );
+            matmul_batched_strided(
+                cublas_handle,
+                grads.d_attn_scores, la.q, grads.d_k,
+                T, d_head, T,
+                T * T, T * d_head, T * d_head,
+                B * H, true, false, 1.0f, 0.0f, stream
+            );
+        }
 
         qkv_split_transpose_backward(grads.d_q, grads.d_k, grads.d_v, grads.d_qkv, B, T, H, d_head, stream);
         NVTX_POP();

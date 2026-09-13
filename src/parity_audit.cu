@@ -8,7 +8,15 @@
 
 int main(int argc, char** argv) {
     std::string data_dir = "tests/parity_data";
-    if (argc > 1) data_dir = argv[1];
+    bool use_tiled = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--tiled_attn") {
+            use_tiled = true;
+        } else if (arg.rfind("--", 0) != 0) {
+            data_dir = arg;
+        }
+    }
 
     std::string cfg_path = data_dir + "/config.txt";
     std::ifstream cfg_in(cfg_path);
@@ -22,11 +30,13 @@ int main(int argc, char** argv) {
            >> config.num_layers >> config.num_heads >> config.vocab_size;
     config.d_head = config.d_model / config.num_heads;
     config.d_ff = 4 * config.d_model;
+    config.use_tiled_attention = use_tiled;
 
     std::cout << "[Parity Audit] Loading config: B=" << config.batch_size
               << ", T=" << config.max_seq_len << ", C=" << config.d_model
               << ", L=" << config.num_layers << ", H=" << config.num_heads
-              << ", V=" << config.vocab_size << "\n";
+              << ", V=" << config.vocab_size
+              << ", TiledAttn=" << (config.use_tiled_attention ? "ENABLED" : "DISABLED") << "\n";
 
     TransformerModel model(config);
 

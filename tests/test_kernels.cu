@@ -208,27 +208,41 @@ bool test_fused_add_bias_residual() {
 }
 
 bool test_tiled_causal_attention() {
-    std::cout << "[Test] Running Tiled Causal Attention kernel verification...";
+    std::cout << "[Test] Running Tiled Causal Attention forward & backward kernel verification...";
     int B = 1, H = 1, T = 8, d_head = 32;
     int total = B * H * T * d_head;
+    int stats_total = B * H * T;
 
     std::vector<float> h_q(total, 0.1f);
     std::vector<float> h_k(total, 0.1f);
     std::vector<float> h_v(total, 1.0f);
     std::vector<float> h_out(total, 0.0f);
+    std::vector<float> h_do(total, 0.5f);
+    std::vector<float> h_dq(total, 0.0f);
+    std::vector<float> h_dk(total, 0.0f);
+    std::vector<float> h_dv(total, 0.0f);
 
-    float *d_q, *d_k, *d_v, *d_out;
+    float *d_q, *d_k, *d_v, *d_out, *d_m, *d_l;
+    float *d_do, *d_dq, *d_dk, *d_dv, *d_workspace;
     CUDA_CHECK(cudaMalloc(&d_q, total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_k, total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_v, total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_out, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_m, stats_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_l, stats_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_do, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dq, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dk, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dv, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_workspace, stats_total * sizeof(float)));
 
     CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), total * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), total * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_do, h_do.data(), total * sizeof(float), cudaMemcpyHostToDevice));
 
     float scale = 1.0f / std::sqrt(static_cast<float>(d_head));
-    tiled_causal_attention_forward(d_q, d_k, d_v, d_out, B, H, T, d_head, scale);
+    tiled_causal_attention_forward(d_q, d_k, d_v, d_out, B, H, T, d_head, scale, d_m, d_l);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, total * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -237,10 +251,33 @@ bool test_tiled_causal_attention() {
         assert(std::fabs(h_out[i] - 1.0f) < 1e-3f);
     }
 
+    tiled_causal_attention_backward(
+        d_q, d_k, d_v, d_out, d_do, d_m, d_l,
+        d_dq, d_dk, d_dv, d_workspace,
+        B, H, T, d_head, scale
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_dq.data(), d_dq, total * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_dk.data(), d_dk, total * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_dv.data(), d_dv, total * sizeof(float), cudaMemcpyDeviceToHost));
+
+    for (int i = 0; i < total; ++i) {
+        assert(!std::isnan(h_dq[i]) && !std::isinf(h_dq[i]));
+        assert(!std::isnan(h_dk[i]) && !std::isinf(h_dk[i]));
+        assert(!std::isnan(h_dv[i]) && !std::isinf(h_dv[i]));
+    }
+
     cudaFree(d_q);
     cudaFree(d_k);
     cudaFree(d_v);
     cudaFree(d_out);
+    cudaFree(d_m);
+    cudaFree(d_l);
+    cudaFree(d_do);
+    cudaFree(d_dq);
+    cudaFree(d_dk);
+    cudaFree(d_dv);
+    cudaFree(d_workspace);
 
     std::cout << " PASSED\n";
     return true;

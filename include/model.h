@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_runtime.h>
 #include <vector>
 #include <string>
@@ -44,6 +45,8 @@ struct LayerActivations {
     float* attn_scores;  // (B, H, T, T)
     float* attn_probs;   // (B, H, T, T)
     float* attn_out;     // (B, H, T, d_head)
+    float* attn_m;       // (B, H, T) for FlashAttention backward
+    float* attn_l;       // (B, H, T) for FlashAttention backward
     float* head_merged;  // (B, T, C)
     float* proj_out;     // (B, T, C)
     float* res1_out;     // (B, T, C)
@@ -87,6 +90,7 @@ struct TransformerGradients {
     float* d_qkv;                 // Scratch buffer (B, T, 3 * C)
     float* d_ln1_out;             // Scratch buffer (B, T, C)
     float* d_emb_out;             // Scratch buffer (B, T, C)
+    float* d_attn_d_scratch;      // Scratch buffer (B, H, T) for FlashAttention backward D_i
 };
 
 class TransformerModel {
@@ -111,10 +115,14 @@ public:
     const TransformerConfig& get_config() const { return config; }
 
     cublasHandle_t get_cublas_handle() const { return cublas_handle; }
+    cublasLtHandle_t get_cublaslt_handle() const { return cublaslt_handle; }
 
 private:
     TransformerConfig config;
     cublasHandle_t cublas_handle;
+    cublasLtHandle_t cublaslt_handle;
+    void* d_cublaslt_workspace;
+    size_t cublaslt_workspace_size;
 
     size_t num_parameters;
     float* d_params_memory; // Contiguous buffer

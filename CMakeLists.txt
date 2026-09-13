@@ -27,7 +27,7 @@ set(CORE_SOURCES
     src/kernels/loss.cu
 )
 
-set(EXTRA_LIBS CUDA::cublas CUDA::cudart)
+set(EXTRA_LIBS CUDA::cublas CUDA::cublasLt CUDA::cudart)
 if (TARGET CUDA::nvToolsExt)
     list(APPEND EXTRA_LIBS CUDA::nvToolsExt)
 endif()
