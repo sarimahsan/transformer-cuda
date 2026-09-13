@@ -379,7 +379,9 @@ __global__ void tiled_causal_attention_fwd_kernel(
     float* __restrict__ out,
     int B, int H, int T,
     float scale,
-    int Br
+    int Br,
+    float* __restrict__ m_out = nullptr,
+    float* __restrict__ l_out = nullptr
 ) {
     int bh = blockIdx.y; // batch and head index: [0, B * H - 1]
     int query_tile_idx = blockIdx.x;
