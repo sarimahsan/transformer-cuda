@@ -17,11 +17,12 @@ def main():
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--tiled_attn", action="store_true", help="Enable FlashAttention-style tiled online softmax")
     parser.add_argument("--cuda_graph", action="store_true", help="Enable CUDA Graph capture and replay")
+    parser.add_argument("--gla", action="store_true", help="Run Chunkwise Gated Linear Attention (GLA) comparative benchmark")
     parser.add_argument("--profile", action="store_true", help="Run automated Nsight Systems profiling suite")
     parser.add_argument("--all", action="store_true", help="Run parity audit, benchmarks, and plot generation")
     args = parser.parse_args()
 
-    if not (args.parity or args.benchmark or args.plot or args.profile or args.all):
+    if not (args.parity or args.benchmark or args.plot or args.profile or args.gla or args.all):
         parser.print_help()
         print("\nDefaulting to running parity verification followed by comparison summary...\n")
         args.parity = True
@@ -68,6 +69,18 @@ def main():
                 with open("results/cuda_benchmark.json", "w") as f:
                     f.write(res.stdout)
                 print("[Benchmark] Pure CUDA telemetry saved to results/cuda_benchmark.json")
+ 
+    if args.gla or args.all:
+        print("\n>>> RUNNING CHUNKWISE GLA COMPARATIVE BENCHMARK <<<")
+        subprocess.run([
+            sys.executable, "scripts/benchmark_gla.py",
+            "--batch_size", str(args.batch_size),
+            "--seq_len", str(args.seq_len),
+            "--d_model", str(args.d_model),
+            "--num_layers", str(args.num_layers),
+            "--num_heads", str(args.num_heads),
+            "--steps", str(args.steps)
+        ])
 
     if args.profile:
         print("\n>>> RUNNING NSIGHT SYSTEMS PROFILER <<<")
