@@ -20,6 +20,7 @@ set(CORE_SOURCES
     src/dataloader.cpp
     src/kernels/embedding.cu
     src/kernels/layernorm.cu
+    src/kernels/rmsnorm.cu
     src/kernels/matmul.cu
     src/kernels/attention.cu
     src/kernels/ffn.cu

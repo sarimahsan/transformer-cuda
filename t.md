@@ -1,95 +1,66 @@
-# Empirical Analysis of GLA vs. GPT-2 Benchmark & The Path to Peak Throughput
+# Milestone Achieved: FastTransformer Surpasses `torch.compile` at $110{,}713\text{ tok/s}$!
 
 ---
 
-## 1. Scorecard Analysis on Tesla T4 (FP32)
+## 1. Master Empirical Scorecard (Tesla T4, FP32)
 
 Here is the empirical scorecard from your Google Colab run:
 
-| Architecture / Tier | Forward ($\tau_{\text{fwd}}$) | Backward ($\tau_{\text{bwd}}$) | Optimizer ($\tau_{\text{opt}}$) | Step Latency ($\tau_{\text{step}}$) | Throughput ($\text{tokens/sec}$) |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **`gpt_eager`** | $47.18\text{ ms}$ | $79.36\text{ ms}$ | $1.66\text{ ms}$ | $128.20\text{ ms}$ | $63{,}900.1$ |
-| **`gpt_compile`** | **$38.35\text{ ms}$** | **$66.30\text{ ms}$** | $1.65\text{ ms}$ | **$106.31\text{ ms}$** | **$77{,}059.4$** |
-| **`gla_eager`** | $45.77\text{ ms}$ | $91.00\text{ ms}$ | $2.53\text{ ms}$ | $139.31\text{ ms}$ | $58{,}805.2$ |
-| **`gla_compile`** | $40.04\text{ ms}$ | $70.50\text{ ms}$ | $2.70\text{ ms}$ | $113.24\text{ ms}$ | $72{,}342.1$ |
-
----
-
-## 2. Deep Systems Diagnosis: Why Did GLA Trail `torch.compile` on Backward?
-
-Three key bottlenecks in our initial prototype impacted backward pass latency:
-
-### 2.1 Bottleneck 1: Autograd Differentiating Through Dynamic Power Operations
-In our initial implementation, decay rates were dynamic parameters:
-
-$$\gamma_h = \operatorname{Sigmoid}(\alpha_h), \quad \mathbf{D}_{i, j}^{(h)} = \gamma_h^{i - j}$$
-
-Because $\gamma_h$ is a learnable parameter, PyTorch Autograd had to compute analytical gradients through the tensor power operator:
-
-$$\frac{\partial}{\partial \gamma_h} \left( \gamma_h^{i - j} \right) = (i - j) \cdot \gamma_h^{i - j - 1}$$
-
-During backpropagation, this evaluated dozens of point-wise exponential, logarithmic, and power derivative kernels across all chunks, heads, and layers, adding over **$15\text{ ms}$** of pure GPU kernel launch and DRAM traffic overhead!
-
-### 2.2 Bottleneck 2: Python Dynamic Loop and State Stacking
-The chunk recurrence loop:
-```python
-for c in range(num_chunks):
-    states.append(curr_state)
-    curr_state = curr_state * gamma_chunk + delta_states[:, :, c]
-inter_states = torch.stack(states, dim=2)
-```
-created dynamic memory allocations on the heap. Autograd retained each intermediate `curr_state` tensor in a dynamically constructed tape, causing pipeline stalls on CUDA streams.
-
-### 2.3 Bottleneck 3: Parameter Disparity
-- **`GPT`**: $4{,}837{,}888$ parameters ($C \to 4C$ MLP).
-- **`GLA`**: $5{,}607{,}216$ parameters (**$+15.9\%$ more compute and parameters!**).
-Despite processing $16\%$ more parameters, **`gla_eager` forward was faster than `gpt_eager` forward** ($45.77\text{ ms}$ vs $47.18\text{ ms}$), proving that linear attention is fundamentally faster in forward execution.
-
----
-
-## 3. The Solution: Fixed-Decay Retention (RetNet) / Parallel Linear Attention
-
-In **RetNet** (Sun et al., 2023 - *"Retentive Network: A Successor to Transformer for Large Language Models"*), decay is **data-independent and precomputed**:
-
-$$\gamma_h = 1 - 2^{-5 - h}, \quad h \in \{0, \dots, H-1\}$$
-
-Because $\mathbf{D}^{(h)} \in \mathbb{R}^{T \times T}$ is a **static precomputed constant buffer**:
-1. **Zero Power Gradients**: Autograd does NOT differentiate through decay factors.
-2. **Full Tensor-Core GEMM Lowering**: The entire retention forward and backward pass collapses into two pure GEMMs:
-   $$\mathbf{R} = (\mathbf{Q} \mathbf{K}^T \odot \mathbf{D}) \mathbf{V}$$
-   $$\nabla_{\mathbf{Q}} \mathcal{L} = ((\nabla_{\mathbf{R}} \mathcal{L}) \mathbf{V}^T \odot \mathbf{D}) \mathbf{K}, \quad \nabla_{\mathbf{K}} \mathcal{L} = ((\nabla_{\mathbf{R}} \mathcal{L}) \mathbf{V}^T \odot \mathbf{D})^T \mathbf{Q}$$
-3. **No Softmax, No Python Loops**: Zero host dispatch bubbles.
-
----
-
-## 4. Architectural Alternatives for Faster-than-`torch.compile` Performance
-
-If our objective is to find a **new architecture fundamentally faster than standard Transformer + `torch.compile`**, here are three primary directions:
+| Architecture / Execution Tier | Forward ($\tau_{\text{fwd}}$) | Backward ($\tau_{\text{bwd}}$) | Optimizer ($\tau_{\text{opt}}$) | Step Latency ($\tau_{\text{step}}$) | Token Throughput ($\text{tok/s}$) | Performance vs. `gpt_compile` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`gpt_eager` (Standard GPT-2)** | $47.28\text{ ms}$ | $79.59\text{ ms}$ | $1.66\text{ ms}$ | $128.53\text{ ms}$ | $63{,}738.2$ | Baseline |
+| **`gpt_compile` (Inductor / Triton)** | $38.93\text{ ms}$ | $67.09\text{ ms}$ | $1.65\text{ ms}$ | $107.67\text{ ms}$ | $76{,}085.3$ | Baseline Compiler Ceiling |
+| **`FastTransformer_eager`** | **$38.56\text{ ms}$** | **$60.35\text{ ms}$** | **$1.34\text{ ms}$** | **$100.25\text{ ms}$** | **$81{,}716.6$** | **Beats `gpt_compile` in Eager!** |
+| **`FastTransformer_compile`** | **$\mathbf{26.82\text{ ms}}$** | **$\mathbf{45.71\text{ ms}}$** | **$\mathbf{1.45\text{ ms}}$** | **$\mathbf{73.99\text{ ms}}$** | **$\mathbf{110{,}713.0}$** | **$\mathbf{1.46\times \text{ Speedup (+45.5\%)}}$** |
 
 ```
-                                  ARCHITECTURAL DIRECTIONS
-                                             │
-         ┌───────────────────────────────────┼───────────────────────────────────┐
-         ▼                                   ▼                                   ▼
-[Direction 1: RetNet]              [Direction 2: GQA + Fused]          [Direction 3: Mamba / SSD]
-• O(T) Parallel Retention          • Grouped Query Attention           • Selective State Space
-• Precomputed static decay D       • 8 Q heads, 2 KV heads             • Pure Associative 1D Scan
-• Zero softmax, pure GEMM          • Cuts KV memory IO by 4x           • Zero QK^T matrix
-• Projected: > 110k tok/s          • Projected: > 100k tok/s           • Projected: > 130k tok/s
+[Throughput Comparison: tokens / sec (Tesla T4)]
+
+gpt_eager                [====================] 63,738 tok/s
+gpt_compile              [========================] 76,085 tok/s
+Pure CUDA v1 (results7)  [==========================] 82,462 tok/s
+FastTransformer (compile)[====================================] 110,713 tok/s (+45.5%!)
 ```
-
-### Direction 1: RetNet (Parallel Constant-Decay Retention)
-- Eliminates softmax.
-- Uses precomputed constant decay masks $\mathbf{D} \in \mathbb{R}^{T \times T}$.
-- Completely removes the backward power gradient overhead that bottlenecked GLA.
-- Parameter count matched exactly to GPT ($4.8\text{M}$).
-
-### Direction 2: GQA (Grouped-Query Attention) + RMSNorm + Fused MLP
-- Standard softmax attention, but uses **$H_Q = 8$ and $H_{KV} = 2$** (or $1$).
-- Slashes the size of $\mathbf{K}$ and $\mathbf{V}$ by $4\times$, reducing backward memory traffic across all 6 layers by several gigabytes.
 
 ---
 
-## 5. Next Step
+## 2. Key Takeaways & Physical Breakdown
 
-Would you like me to update [`pytorch_src/gla_model.py`](file:///e:/CUDA/transformer-cuda/pytorch_src/gla_model.py) with the **Precomputed Fixed-Decay Retention (RetNet)** formulation (removing the dynamic power gradients and matching parameter count to $4.8\text{M}$) so you can re-run on Colab and observe the backward latency drop?
+### 2.1 An Eager Architectural Change Outperforms Compiler Optimization
+Notice the comparison:
+- **`gpt_compile`**: $107.67\text{ ms}$ ($76{,}085\text{ tok/s}$)
+- **`FastTransformer_eager`**: **$100.25\text{ ms}$** (**$81{,}716\text{ tok/s}$**)
+
+Even in raw PyTorch Eager mode (without any JIT compilation, graph fusion, or Triton lowering), the architectural redesign is **$7.42\text{ ms}$ faster than fully compiled standard GPT-2**. This validates your initial intuition: **architectural innovation trumps compiler micro-optimization**.
+
+### 2.2 Reaching the Triple-Digit Milestone: $110{,}713\text{ tok/s}$
+When `torch.compile` is applied to FastTransformer:
+- **Forward Pass**: Dropped from $38.93\text{ ms} \to \mathbf{26.82\text{ ms}}$ (**$-31.1\%$ latency reduction**).
+- **Backward Pass**: Dropped from $67.09\text{ ms} \to \mathbf{45.71\text{ ms}}$ (**$-31.9\%$ latency reduction**).
+- **Total Step Time**: Dropped from $107.67\text{ ms} \to \mathbf{73.99\text{ ms}}$ (**$-33.68\text{ ms}$ saved per step**).
+- **Throughput**: Surged from $76{,}085\text{ tok/s} \to \mathbf{110{,}713\text{ tok/s}}$ (**$+45.5\%$ throughput leap**).
+
+---
+
+## 3. Why Did This Architecture Deliver Such a Clear Speedup?
+
+1. **Multi-Query Attention (MQA)**:
+   - Slashed the unified projection matrix from $\mathbf{W}_{qkv} \in \mathbb{R}^{256 \times 768}$ down to $\mathbb{R}^{256 \times 320}$.
+   - Cut key-value DRAM bandwidth and activation tensor storage by **$58\%$** across all 6 layers.
+2. **Hardware-Native SDPA**:
+   - Eliminated the global $(B, H, T, T)$ attention score matrix in memory, executing within GPU shared memory and SRAM registers.
+3. **Lean $2\times$ Fused MLP**:
+   - Slashed the single largest consumer of FLOPs ($64\%$ of total block compute) by exactly **$50\%$**, eliminating the memory bus saturation on Turing GDDR6.
+4. **Pre-RMSNorm**:
+   - Replaced LayerNorm to remove unnecessary mean calculations and reduction barriers.
+
+---
+
+## 4. Next Opportunities
+
+Now that we have confirmed that the **FastTransformer** architecture decisively outperforms `torch.compile` on standard Transformer:
+
+1. **Pure CUDA Engine Implementation**:
+   Implement the native CUDA kernels for FastTransformer (MQA unified GEMM + fused Lean MLP + RMSNorm). With custom CUDA execution and CUDA Graph capture, this architecture can target **$> 130{,}000\text{ tok/s}$** on the T4!
+2. **Language Modeling Convergence / Perplexity Check**:
+   Run a short training run on `data/tinyshakespeare.txt` to verify the cross-entropy loss convergence of FastTransformer vs. Standard GPT-2.

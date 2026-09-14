@@ -17,12 +17,13 @@ def main():
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--tiled_attn", action="store_true", help="Enable FlashAttention-style tiled online softmax")
     parser.add_argument("--cuda_graph", action="store_true", help="Enable CUDA Graph capture and replay")
-    parser.add_argument("--gla", action="store_true", help="Run Chunkwise Gated Linear Attention (GLA) comparative benchmark")
+    parser.add_argument("--gla", action="store_true", help="Run FastTransformer / GLA comparative benchmark")
+    parser.add_argument("--convergence", action="store_true", help="Run language modeling convergence audit (GPT vs FastTransformer)")
     parser.add_argument("--profile", action="store_true", help="Run automated Nsight Systems profiling suite")
     parser.add_argument("--all", action="store_true", help="Run parity audit, benchmarks, and plot generation")
     args = parser.parse_args()
 
-    if not (args.parity or args.benchmark or args.plot or args.profile or args.gla or args.all):
+    if not (args.parity or args.benchmark or args.plot or args.profile or args.gla or args.convergence or args.all):
         parser.print_help()
         print("\nDefaulting to running parity verification followed by comparison summary...\n")
         args.parity = True
@@ -80,6 +81,18 @@ def main():
             "--num_layers", str(args.num_layers),
             "--num_heads", str(args.num_heads),
             "--steps", str(args.steps)
+        ])
+
+    if args.convergence or args.all:
+        print("\n>>> RUNNING CONVERGENCE & PERPLEXITY TRAINING AUDIT <<<")
+        subprocess.run([
+            sys.executable, "scripts/compare_convergence.py",
+            "--batch_size", str(args.batch_size),
+            "--seq_len", str(args.seq_len),
+            "--d_model", str(args.d_model),
+            "--num_layers", str(args.num_layers),
+            "--num_heads", str(args.num_heads),
+            "--steps", str(args.steps if args.steps >= 100 else 200)
         ])
 
     if args.profile:

@@ -21,6 +21,8 @@ struct TransformerConfig {
     float adam_eps = 1e-8f;       // AdamW epsilon
     float grad_clip = 1.0f;       // Gradient norm clipping threshold
     bool use_tiled_attention = false; // FlashAttention-style tiled online softmax
+    bool is_fast_arch = false;        // FastTransformer architecture (MQA + RMSNorm + Lean MLP)
+    size_t num_kv_heads = 8;          // Number of Key/Value heads (1 for MQA)
 
     void validate() const {
         if (d_model % num_heads != 0) {
