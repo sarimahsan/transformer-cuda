@@ -61,8 +61,7 @@ def benchmark_single(
             d_model=d_model,
             num_layers=num_layers,
             num_heads=num_heads,
-            d_ff=3 * d_model,
-            chunk_size=64
+            d_ff=640
         ).to(device)
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
