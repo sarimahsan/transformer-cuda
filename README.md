@@ -201,6 +201,19 @@ Empirical performance evaluation across framework tiers on **Tesla T4 GPU (FP32)
 | **PyTorch CUDA Graphs** | $3.21 \pm 0.02$ | $1.08 \pm 0.01$ | $1.78 \pm 0.01$ | $0.35 \pm 0.01$ | $79{,}430$ | Low Jitter |
 | **Pure CUDA (Our Engine)** | **$3.19 \pm 0.02$** | **$1.05 \pm 0.01$** | **$1.81 \pm 0.01$** | **$0.33 \pm 0.01$** | **$80{,}120$** | **$6.0\times$ Lower Variance** |
 
+### 5.1 Architectural Innovation: FastTransformer ($114{,}016\text{ tok/s}$)
+
+To break the hardware roofline of standard GPT-2 on Turing GPUs, we introduced **FastTransformer** combining:
+- **Multi-Query Attention (MQA)**: Slashes Key/Value DRAM bandwidth by $58\%$ ($\mathbf{W}_{qkv} \in \mathbb{R}^{256 \times 320}$).
+- **Hardware-Fused Native SDPA**: Zero DRAM intermediate attention maps.
+- **Lean $2\times$ Fused MLP**: Slashes the dominant $64\%$ compute stage in half ($d_{\text{ff}} = 512$).
+- **Vectorized Pre-RMSNorm**: Eliminates mean-centering and reduction passes.
+
+| Architecture / Tier | Parameters | Final Loss (200 Steps) | Perplexity ($\operatorname{PPL}$) | Step Latency | Throughput | Throughput Advantage |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Standard GPT-2 (`torch.compile`)** | $4{,}837{,}888$ | $2.5217$ | $12.45$ | $102.54\text{ ms}$ | $79{,}890\text{ tok/s}$ | Baseline |
+| **FastTransformer (`torch.compile`)** | **$2{,}559{,}744$** | **$2.4830$** | **$11.98$** | **$71.85\text{ ms}$** | **$114{,}016\text{ tok/s}$** | **$\mathbf{+42.7\% \text{ Boost}}$** |
+
 ---
 
 ## 6. Getting Started
